@@ -1,27 +1,44 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  DOSYA: video_reader.py                                                      ║
-║  KATMAN: Veri Kaynağı — plan/01 §1.1                                        ║
-║  ROL   : Ham video karesini okuyup Kanal A ve Kanal B'ye sunar.              ║
-║          Kanal A ve Kanal B bu jeneratörü paylaşır; her kanal kendi          ║
-║          örnekleme/işleme mantığını üstüne kurar.                            ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Kanal B - Video Okuyucu Modülü (video_reader.py)
+================================================
 
-VERİ AKIŞI İÇİNDEKİ YERİ:
-  [Video Dosyası] → read_video_stream() → RawFrame → preprocessing.py
+Bu modül, video dosyalarından ham görüntü karelerini (raw frames) ve zaman
+damgası meta verilerini yüksek doğrulukla çözümlemek (decode etmek) için PyAV
+(FFmpeg C-API Python bağlamları) kütüphanesini kullanır.
 
-NEDEN PyAV (av), cv2.VideoCapture değil?
-  - cv2.VideoCapture bazı container/codec kombinasyonlarında PTS (zaman damgası)
-    okumalarında hata yapar veya tutarsız sonuç döner.
-  - PyAV doğrudan decoder PTS'ine eriştiği için VFR (değişken kare hızlı)
-    videolarda bile doğru timestamp_sec üretir.
-  - thread_type="AUTO" ile çok çekirdekli decode desteği sağlanabilir.
+Mimari Rolü ve Veri Akışı:
+--------------------------
+Kanal A ve Kanal B ortak video akış kaynağı olarak bu jeneratörü paylaşır:
+    [Video Dosyası]
+           │
+           ▼
+    read_video_stream() / VideoReader
+           │
+           ▼
+        RawFrame (RGB24 numpy dizisi, PTS tabanlı saniye damgası, sıra no)
+           │
+           ├──► Kanal A (Nesne Tespiti, Takip, Hareket Analizi)
+           └──► Kanal B (preprocessing.py: SSIM analizi, Keskinlik filtreleme, Kırpma)
 
-SINIFLAR VE FONKSİYONLAR:
-  RawFrame        : Tek kare = piksel verisi (RGB numpy) + meta bilgisi
-  VideoReader     : Yeniden kullanılabilir sınıf (context manager), kare sayısı tahmini yapar
-  read_video_stream() : preprocessing.py'nin import ettiği basit jeneratör arayüzü
+Neden OpenCV (cv2.VideoCapture) Yerine PyAV (FFmpeg)?
+-----------------------------------------------------
+1. **Değişken Kare Hızı (VFR - Variable Frame Rate) Uyumluluğu:**
+   - Standart OpenCV `cv2.VideoCapture.get(CAP_PROP_POS_MSEC)` değişken kare hızlı
+     veya bazı MP4/MKV konteynerlerinde zaman damgalarını (PTS) yanlış hesaplayabilir
+     ya da kare atlayabilir.
+   - PyAV, doğrudan FFmpeg dekoder seviyesindeki PTS (Presentation Time Stamp) ve
+     `time_base` oranına erişir. Bu sayede her karenin video başlangıcına göre
+     gerçek mutlak saniyesi (`timestamp_sec`) tam doğrulukla hesaplanır.
+
+2. **Çok Çekirdekli Decode (Multithreading):**
+   - FFmpeg dekoderi `thread_type="AUTO"` ile çok çekirdekli donanım/CPU optimizasyonu
+     sağlar.
+
+3. **Bellek Dostu Akış (Streaming):**
+   - Tüm videoyu RAM'e yüklemek yerine jeneratör modeliyle kare kare akış sunarak
+     bellek tüketimini minimumda tutar.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -34,65 +51,93 @@ from numpy.typing import NDArray
 
 
 # ---------------------------------------------------------------------------
-# RawFrame — her iki kanal (A ve B) için ortak ham kare veri yapısı
+# RawFrame — Kanallar Arası Ortak Kare Veri Yapısı
 # ---------------------------------------------------------------------------
 
 @dataclass
 class RawFrame:
-    """Tek bir video karesinin ham verisi ve konum meta bilgisi.
+    """Tek bir video karesine ait piksel verisi ve zamanlama meta bilgileri.
 
-    preprocessing.py bu dataclass'ı alır; kendi _Candidate iç yapısına sarar.
-    Kanal A da aynı RawFrame'i kendi örnekleme mantığında kullanır.
+    Bu veri yapısı, videodan okunan ham kareden türetilir ve Kanal B ön işleme
+    katmanında (:class:`preprocessing._Candidate`) paketlenerek kullanılır.
+    Aynı zamanda Kanal A'nın örnekleme döngüsünde de paylaşılan ortak veri sözleşmesidir.
 
-    frame_index  : 0'dan başlayan karenin sıra numarası (stride filtresi için)
-    timestamp_sec: PTS'ten hesaplanan gerçek zaman (MIN_GAP_SEC kararı için)
-    rgb          : (H, W, 3) uint8 numpy dizisi, RGB sırasında (BGR değil!)
+    Attributes:
+        frame_index (int): Videonun 0-indeksli ardışık kare numarası. Adım (stride)
+            filtrelemeleri için temel referanstır.
+        timestamp_sec (float): FFmpeg PTS değerinden saniyeye çevrilen gerçek zaman
+            konumu. Kareler arası asgari süre (MIN_GAP_SEC) kontrolleri bu alana dayanır.
+        rgb (NDArray[np.uint8]): (H, W, 3) boyutlarında `uint8` tipinde RGB renk
+            uzayındaki numpy dizisi.
+            .. note::
+                OpenCV fonksiyonları varsayılan olarak BGR formatı bekler. Görüntüyü
+                OpenCV'ye aktarırken `cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2BGR)`
+                dönüşümü gerekebilir.
     """
-    frame_index: int           # videonun 0-bazlı kare indeksi
-    timestamp_sec: float       # videonun başından itibaren saniye
-    rgb: NDArray[np.uint8]     # (H, W, 3) RGB24 — cv2 fonksiyonları BGR bekler, dikkat!
+    frame_index: int
+    timestamp_sec: float
+    rgb: NDArray[np.uint8]
 
 
 # ---------------------------------------------------------------------------
-# VideoReader — gelişmiş kullanım için yeniden kullanılabilir sınıf
+# VideoReader — Nesne Yönelimli Video Okuyucu Sınıfı
 # ---------------------------------------------------------------------------
 
 class VideoReader:
-    """PyAV tabanlı güvenli video okuyucu sınıfı.
+    """PyAV tabanlı güvenli, bağlam yöneticisi (context manager) destekli video okuyucu.
 
-    Doğrudan kullanım (gelişmiş ihtiyaçlar için):
-        with VideoReader("video.mp4") as vr:
-            print(vr.total_frames, vr.fps)
-            for frame_rgb in vr.iter_frames(max_frames=100):
-                ...  # frame_rgb: (H, W, 3) numpy uint8
+    Gelişmiş video okuma, meta veri sorgulama (toplam kare, FPS, süre) ve özel
+    aralık iterasyonları için tasarlanmıştır.
 
-    Basit kullanım için read_video_stream() jeneratörünü tercih et.
+    Examples:
+        >>> with VideoReader("ornek_video.mp4") as reader:
+        ...     print(f"FPS: {reader.fps}, Toplam Kare: {reader.total_frames}")
+        ...     for frame_rgb in reader.iter_frames(max_frames=10):
+        ...         print(frame_rgb.shape)
+
+    Note:
+        Daha basit jeneratör akışları ve zaman damgası takibi için modül düzeyindeki
+        :func:`read_video_stream` fonksiyonu tercih edilmelidir.
     """
 
     def __init__(self, path: str | Path) -> None:
+        """Video dosyasını açar ve video akışı meta verilerini inceler.
+
+        Args:
+            path (str | Path): Açılacak video dosyasının dosya sistemi yolu.
+
+        Raises:
+            FileNotFoundError: Belirtilen video dosyası bulunamazsa.
+            av.AVError: Video dosyası bozuksa veya çözülemiyorsa.
+        """
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"Video bulunamadı: {self.path}")
 
-        # container açıkta kalır; close() veya __exit__ ile kapatılmalı
+        # PyAV konteyneri açık tutulur; close() veya __exit__ ile kapatılmalıdır.
         self.container = av.open(str(self.path))
         self.stream = self.container.streams.video[0]
         self._total_frames: int = self._estimate_total_frames()
-        # average_rate yoksa (bazı VFR videolar) güvenli default olarak 25 fps kullan
+        # average_rate yoksa (bazı VFR videolarda) güvenli varsayılan olarak 25.0 fps kullanılır.
         self._fps: float = float(self.stream.average_rate) if self.stream.average_rate else 25.0
 
     # ------------------------------------------------------------------
-    # Kare sayısı tahmini — üç kademeli güvenli yöntem
+    # Kare Sayısı Tahmini — Üç Kademeli Güvenli Yöntem
     # ------------------------------------------------------------------
 
     def _estimate_total_frames(self) -> int:
-        """Container'dan kare sayısını üç farklı yöntemle tahmin eder.
+        """Konteynerden toplam kare sayısını 3 kademeli yöntemle hesaplar/tahmin eder.
 
-        1. Yöntem: stream.frames (en hızlı, ama bazı container'larda eksik)
-        2. Yöntem: duration * fps (meta veri var ama frames yoksa)
-        3. Yöntem: decode ederek say (en yavaş, son çare)
+        Yöntem 1: Konteyner meta verisi (`stream.frames`). En hızlıdır ancak her
+                  konteynerde doğru yazılmış olmayabilir.
+        Yöntem 2: Süre ve FPS çarpımı (`duration * fps`). Meta veride süre varsa kullanılır.
+        Yöntem 3: Akışı baştan sona decode ederek sayma. En yavaş ama en kesin çözümdür,
+                  son çare olarak başvurulur.
+
+        Returns:
+            int: Videodaki tahmini veya kesin toplam kare sayısı (asgari 1).
         """
-        # 1. Yöntem: container meta verisi
+        # 1. Yöntem: Konteyner meta verisi
         total = self.stream.frames
         if total and total > 0:
             return total
@@ -104,30 +149,41 @@ class VideoReader:
         if duration and time_base and avg_rate:
             return int(float(duration * time_base) * float(avg_rate))
 
-        # 3. Yöntem: kareleri tek tek say, sonra stream'i başa sar
+        # 3. Yöntem: Kareleri decode ederek say, ardından konteyneri başa sar
         total = sum(1 for _ in self.container.decode(video=0))
         self.container.seek(0)
         return total or 1
 
     @property
     def total_frames(self) -> int:
-        """Toplam tahmini kare sayısı."""
+        """Videodaki tahmini veya kesin toplam kare sayısı."""
         return self._total_frames
 
     @property
     def fps(self) -> float:
-        """Saniyedeki kare sayısı (ortalama)."""
+        """Videonun saniye başına ortalama kare hızı (Frames Per Second)."""
         return self._fps
 
     def duration_seconds(self) -> float:
-        """Video süresini saniye cinsinden döner."""
+        """Videonun toplam süresini saniye cinsinden hesaplar.
+
+        Returns:
+            float: Saniye cinsinden video süresi.
+        """
         return self._total_frames / self._fps if self._fps else 0.0
 
     def iter_frames(self, max_frames: int | None = None) -> Iterator[NDArray[np.uint8]]:
-        """RGB24 numpy dizisi olarak kareleri döner (RawFrame meta bilgisi olmadan).
+        """RGB24 formatında numpy dizisi olarak kare piksellerini döner.
 
-        Sadece piksel verisi gerekiyorsa kullan.
-        timestamp_sec ve frame_index de gerekiyorsa read_video_stream() kullan.
+        Meta veriler (zaman damgası, kare indeksi) gerekmeksizin yalnızca piksel
+        matrisleri üzerinden hızlı tarama yapılmak istendiğinde kullanılır.
+
+        Args:
+            max_frames (int | None, optional): Okunacak azami kare sayısı.
+                None verilirse videonun sonuna kadar okur. Varsayılan None.
+
+        Yields:
+            NDArray[np.uint8]: (H, W, 3) boyutlu uint8 formatında RGB piksel dizisi.
         """
         self.container.seek(0)
         count = 0
@@ -138,38 +194,49 @@ class VideoReader:
                 break
 
     def close(self) -> None:
-        """Container'ı kapat, belleği serbest bırak."""
+        """Açık olan PyAV konteynerini kapatır ve dosya/bellek tanıtıcılarını serbest bırakır."""
         self.container.close()
 
     def __enter__(self) -> "VideoReader":
+        """Context manager giriş noktası."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Context manager çıkışında otomatik kaynak temizliği."""
         self.close()
 
 
 # ---------------------------------------------------------------------------
-# read_video_stream — preprocessing.py'nin kullandığı birincil arayüz
+# read_video_stream — Ön İşleme Katmanının Birincil Giriş Fonksiyonu
 # ---------------------------------------------------------------------------
 
 def read_video_stream(video_path: str) -> Iterator[RawFrame]:
-    """Videoyu baştan sona akış halinde okur; her kare için RawFrame döner.
+    """Videoyu baştan sona akış (generator) halinde çözer; her kare için RawFrame üretir.
 
-    preprocessing.py bu jeneratörü şöyle kullanır:
+    Kanal B ön işleme katmanı (:mod:`preprocessing`) bu fonksiyonu şu şekilde tüketir:
+
+    .. code-block:: python
+
         for frame in read_video_stream(video_path):
             if frame.frame_index % CANDIDATE_STRIDE != 0:
-                continue           # her 5. kareyi işle (CANDIDATE_STRIDE=5)
-            ...
+                continue  # Sadece belirli adımlardaki kareleri işle
+            # frame.timestamp_sec ve frame.rgb ile devam et
 
-    NEDEN BU ARAYÜZ?
-      - Videoyu belleğe tamamen yüklemez (streaming) → büyük videolar için verimli
-      - frame_index: stride filtresi için (her N. kare)
-      - timestamp_sec: MIN_GAP_SEC kontrolü için (seçilen kareler arası min süre)
-      - rgb: cv2 ve skimage işlemleri için direkt kullanılabilir numpy array
+    Tasarım Özellikleri:
+        - **Düşük Bellek İzi:** Kareler gerektikçe decode edilir, RAM'e tüm video dolmaz.
+        - **Hassas PTS:** `pts * time_base` formülüyle her kareye tam zaman damgası atanır.
+        - **Bozuk Konteyner Fallback:** PTS bilgisi eksikse `frame_index / fps` üzerinden
+          güvenli zaman tahmini yapılır.
 
-    PTS → timestamp_sec dönüşümü:
-      pts_in_seconds = frame.pts * stream.time_base
-      pts yoksa (bozuk container) → frame_index / fps ile tahmin edilir.
+    Args:
+        video_path (str): İncelenecek video dosyasının dosya yolu.
+
+    Yields:
+        RawFrame: Sıra indeksi, mutlak zaman damgası ve (H, W, 3) RGB numpy matrisi.
+
+    Raises:
+        FileNotFoundError: Belirtilen video dosyası mevcut değilse.
+        av.AVError: FFmpeg video konteynerini açamaz veya çözemezse.
     """
     path = Path(video_path)
     if not path.exists():

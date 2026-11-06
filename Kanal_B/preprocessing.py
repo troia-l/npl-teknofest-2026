@@ -1,64 +1,82 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  DOSYA: preprocessing.py                                                     ║
-║  KATMAN: Kanal B Ön İşleme — plan/01 §1.3                                   ║
-║  ROL   : Ham videoyu → VLM'e gönderilebilir kare paketine (S1b) dönüştürür. ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Kanal B - Video Ön İşleme Katmanı (preprocessing.py)
+===================================================
 
-VERİ AKIŞI İÇİNDEKİ YERİ:
-  video_reader.py → [RawFrame akışı]
-    → _collect_candidates()   : Her 5. kareyi tara, metrik hesapla
-    → _select_frames()        : En bilgilendirici 8 kareyi seç
-    → _apply_clahe_if_needed(): Karanlık kareleri aydınlat
-    → _build_grid()           : 8 kareyi 2×4 grid'e diz
-    → build_vlm_frame_packet(): Hepsini S1b paketine sar → backend.py'ye gönder
+Bu modül, ham video verilerini multimodal Görsel Dil Modelleri (VLM) tarafından
+işlenebilir standart paketlere veya optimize video kliplerine dönüştürür.
 
-NEDEN GRİD?
-  VLM'e 8 ayrı görüntü yerine tek bir grid görseli gönderilir:
-  - Tek HTTP çağrısı → daha hızlı
-  - Model tüm zaman dilimini bir arada görür → bağlamsal yorum daha iyi
-  - Mevcut grid boyutu: 4 sütun × 2 satır = 8 hücre, her hücre config'den gelir
+İki Farklı Ön İşleme Yolu:
+--------------------------
+1. **Video Modu Ön İşleme (EVREN VLM İçin Birincil Yol):**
+   - TEKNOFEST EVREN VLM modeli, doğrudan video kliplerini kabul eder.
+   - :func:`probe_video`: Videonun süre, çözünürlük ve kare hızını decode etmeden inceler.
+   - :func:`detect_scene_boundaries`: SSIM yapısal benzerlik farklarına bakarak videoyu
+     doğal sahne geçişlerinden keser. Asgari ve azami (60 sn) süre kısıtlarını zorunlu tutar.
+   - :func:`extract_video_segment`: Seçilen zaman aralığını GPU (h264_nvenc) veya CPU (libx264)
+     donanım hızlandırmasıyla 720p H.264 MP4 formatında dışa aktarır.
+   - :func:`prepare_video_segments`: Kısıtlara uyan videoları doğrudan geçirir (prefix cache dostu),
+     uzun videoları ise 60 saniyelik kliplere böler.
 
-AKILLI ÖRNEKLEME ALGORİTMASI (3 aşamalı):
-  Aşama 1 — Bulanık filtre: Laplacian varyansı < eşik olan kareler elenir
-  Aşama 2 — Sahne değişimi greedy seçim: SSIM farkı yüksek, zaman boşluklu kareler
-  Aşama 3 — Fallback doldurma: Hâlâ 8'e ulaşılamadıysa eşit aralıklı ekle
-
-TÜM PARAMETRELERİ config.yaml'daki [preprocessing:] bloğu belirler (S4 değişikliği).
-config.yaml yoksa parantez içindeki default değerler devreye girer.
+2. **Grid / Mozaik Ön İşleme (S1b Sözleşmesi — Yerel Modeller İçin Geriye Dönük Yol):**
+   - Görsel modeller (vLLM, llama.cpp vb.) için 3 aşamalı akıllı örnekleme uygular:
+     - **Aşama 1 (Bulanıklık Filtresi):** Laplacian varyansı düşük (odak dışı/hareket bulanık)
+       kareler elenir.
+     - **Aşama 2 (Sahne Değişimi Greedy Seçimi):** SSIM farkı yüksek ve aralarında asgari
+       zaman boşluğu (`MIN_GAP_SEC`) olan kareler seçilir.
+     - **Aşama 3 (Fallback Doldurma):** Hedef kare sayısına (örn. 8) ulaşılamazsa zaman
+       ekseninde eşit aralıklı örnekleme yapılır.
+     - **Aşama 4 (CLAHE Düşük Işık Düzeltmesi):** Ortalama parlaklığı eşik altında olan
+       karanlık karelerin L (parlaklık) kanalına adaptif histogram eşitleme uygulanır.
+     - **Aşama 5 (Grid Montajı):** Seçilen kareler 2x4 boyutlarında tek bir mozaik
+       JPEG görselinde birleştirilir ve :class:`contracts.VLMFramePacket` (S1b) üretilir.
 """
+
 from __future__ import annotations
+
 import os
 import uuid
-import yaml                                          # config.yaml okuma için
 from dataclasses import dataclass
+from fractions import Fraction
+from typing import Any
 
+import av
 import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
+import yaml
 
-# video_reader.py'den ham kare akışı arayüzü
-from video_reader import RawFrame, read_video_stream
-
-# contracts.py'den S1b sözleşme veri yapıları
-from contracts import (
-    VLMFramePacket, FrameMeta, FrameQualityMetrics,
-    GridLayout, EnhancementInfo,
-)
+# Paket içi veya doğrudan çalıştırma uyumlu esnek importlar
+try:
+    from .video_reader import RawFrame, read_video_stream
+    from .contracts import (
+        EnhancementInfo,
+        FrameMeta,
+        FrameQualityMetrics,
+        GridLayout,
+        VLMFramePacket,
+        format_mmss,
+    )
+except ImportError:
+    from video_reader import RawFrame, read_video_stream
+    from contracts import (
+        EnhancementInfo,
+        FrameMeta,
+        FrameQualityMetrics,
+        GridLayout,
+        VLMFramePacket,
+        format_mmss,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Config yükleme — tüm sabitler buradan gelir (S4 değişikliği)
+# Konfigürasyon Yükleme
 # ---------------------------------------------------------------------------
 
-def _load_cfg() -> dict:
-    """Proje kökündeki config.yaml'ın [preprocessing:] bloğunu yükler.
+def _load_cfg() -> dict[str, Any]:
+    """Proje kökündeki `config.yaml` dosyasının `[preprocessing:]` bloğunu yükler.
 
-    Neden modül seviyesinde bir kez yükleniyor?
-      - Her çağrıda disk okumaktan kaçınmak için
-      - Değiştirildiğinde sadece config.yaml güncellenir, kod değişmez
-
-    Dosya yoksa boş dict döner → tüm sabitler kendi default değerlerini kullanır.
+    Returns:
+        dict[str, Any]: Ön işleme hiperparametrelerini içeren sözlük. Dosya yoksa boş dict.
     """
     cfg_path = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "config.yaml")
@@ -66,125 +84,126 @@ def _load_cfg() -> dict:
     if not os.path.exists(cfg_path):
         return {}
     with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f).get("preprocessing", {})
+        data = yaml.safe_load(f) or {}
+        return data.get("preprocessing", {})
 
 
-_CFG = _load_cfg()  # modül yüklendiğinde bir kez çalışır
-
-# ---------------------------------------------------------------------------
-# Ayarlanabilir sabitler — config.yaml'dan okunur, yoksa default değer
-# ---------------------------------------------------------------------------
-
-# Kaç kare seçileceği — aynı zamanda grid hücre sayısını da belirler
-TARGET_FRAME_COUNT   = _CFG.get("target_frame_count", 8)
-
-# Her kaç karede bir aday metriği hesaplanır (5 → her 5. kare)
-# Daha küçük = daha hassas ama daha yavaş; büyük videolarda artır
-CANDIDATE_STRIDE     = 5  # config.yaml'da tanımlı değil, sabit kalır
-
-# Laplacian varyansı bu değerin altındaki kareler "bulanık" sayılır ve elenir
-# config.yaml: min_laplacian_variance: 80.0 — test ederek idealini bul
-MIN_SHARPNESS        = _CFG.get("min_laplacian_variance", 40.0)
-
-# Seçilen iki kare arasındaki minimum zaman farkı (saniye)
-# Bu sayede tüm kareler videonun tek bir anından gelmez, zamansal çeşitlilik sağlanır
-MIN_GAP_SEC          = 1.0  # config.yaml'da tanımlı değil, sabit kalır
-
-# Ortalama parlaklık bu değerin altındaysa CLAHE uygulanır (0=siyah, 255=beyaz)
-LOW_LIGHT_BRIGHTNESS = 90.0  # config.yaml'da tanımlı değil, sabit kalır
-
-# CLAHE parametreleri — kontrast sınır katsayısı ve mozaik ızgara boyutu
-CLAHE_CLIP_LIMIT     = _CFG.get("clahe_clip_limit", 2.5)
-CLAHE_TILE_GRID      = tuple(_CFG.get("clahe_grid_size", [8, 8]))
-
-# Tek grid hücresi boyutu (w, h) — config.yaml'dan gelir
-# NOT: frame_height=216 kullanılırsa hücre dikdörtgen olur (384×216), 384×384 değil
-_W                   = _CFG.get("frame_width", 384)
-_H                   = _CFG.get("frame_height", 384)
-CELL_SIZE            = (_W, _H)
-
-# Grid düzeni — TARGET_FRAME_COUNT / GRID_COLS satır sayısını belirler
-GRID_COLS            = _CFG.get("grid_columns", 4)
-GRID_ROWS            = TARGET_FRAME_COUNT // GRID_COLS  # 8 // 4 = 2
-
+_CFG = _load_cfg()
 
 # ---------------------------------------------------------------------------
-# İç veri yapısı — yalnızca bu modül içinde kullanılır
+# Ayarlanabilir Sabitler (Grid ve Örnekleme Parametreleri)
+# ---------------------------------------------------------------------------
+
+#: Grid için seçilecek hedef kare sayısı (varsayılan: 8)
+TARGET_FRAME_COUNT: int = _CFG.get("target_frame_count", 8)
+
+#: Aday havuzu oluşturulurken kaç karede bir metrik hesaplanacağı (varsayılan: her 5. kare)
+CANDIDATE_STRIDE: int = 5
+
+#: Laplacian varyansı bu eşiğin altında kalan kareler bulanık kabul edilir (varsayılan: 40.0)
+MIN_SHARPNESS: float = _CFG.get("min_laplacian_variance", 40.0)
+
+#: Seçilen ardışık kareler arasında bulunması gereken asgari zaman farkı (saniye, varsayılan: 1.0)
+MIN_GAP_SEC: float = 1.0
+
+#: Ortalama piksel parlaklığı bu değerin altındaysa CLAHE iyileştirmesi tetiklenir (varsayılan: 90.0)
+LOW_LIGHT_BRIGHTNESS: float = 90.0
+
+#: CLAHE kontrast sınırlandırma katsayısı (varsayılan: 2.5)
+CLAHE_CLIP_LIMIT: float = _CFG.get("clahe_clip_limit", 2.5)
+
+#: CLAHE bölgesel ızgara çözünürlüğü (varsayılan: (8, 8))
+CLAHE_TILE_GRID: tuple[int, int] = tuple(_CFG.get("clahe_grid_size", [8, 8]))
+
+#: Grid tekil hücre piksel genişliği ve yüksekliği
+_W: int = _CFG.get("frame_width", 384)
+_H: int = _CFG.get("frame_height", 384)
+CELL_SIZE: tuple[int, int] = (_W, _H)
+
+#: Grid sütun ve satır yerleşimi
+GRID_COLS: int = _CFG.get("grid_columns", 4)
+GRID_ROWS: int = TARGET_FRAME_COUNT // GRID_COLS
+
+
+# ---------------------------------------------------------------------------
+# İç Veri Yapısı (Yalnızca Grid Aday Seçimi İçin)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class _Candidate:
-    """Kare seçim sürecindeki bir aday kare.
+    """Kare seçim algoritmasında değerlendirilen aday kare yapısı.
 
-    _collect_candidates() tarafından üretilir, _select_frames() tarafından tüketilir.
-    RawFrame'i sarmalar + hesaplanan 3 metriği tutar.
+    Attributes:
+        frame (RawFrame): Ham kare referansı (indeks, zaman damgası, piksel matrisi).
+        laplacian_var (float): Hesaplanmış keskinlik metriği.
+        ssim_diff (float): Bir önceki adaya göre sahne farkı oranı (1.0 - SSIM).
+        brightness (float): Karenin ortalama parlaklık değeri (0.0 - 255.0).
     """
-    frame: RawFrame        # ham kare (frame_index, timestamp_sec, rgb)
-    laplacian_var: float   # keskinlik metriği — bulanık eşik karşılaştırması için
-    ssim_diff: float       # bir önceki adayla sahne farkı — değişim tespiti için
-    brightness: float      # ortalama parlaklık — CLAHE kararı için
+    frame: RawFrame
+    laplacian_var: float
+    ssim_diff: float
+    brightness: float
 
 
 # ---------------------------------------------------------------------------
-# Yardımcı hesaplama fonksiyonları
+# Yardımcı Metrik Hesaplama Fonksiyonları
 # ---------------------------------------------------------------------------
 
 def _laplacian_var(gray: np.ndarray) -> float:
-    """Gri tonlamalı kareden Laplacian varyansı hesaplar.
+    """Gri tonlamalı görüntü matrisinden Laplacian varyansı (keskinlik) hesaplar.
 
-    Yüksek değer = keskin kare (net kenarlar var)
-    Düşük değer  = bulanık kare (odak dışı ya da hareket bulanıklığı)
-    MIN_SHARPNESS eşiğiyle karşılaştırılarak bulanık kareler elenir.
+    Args:
+        gray (np.ndarray): 2 boyutlu uint8 gri tonlamalı görüntü matrisi.
+
+    Returns:
+        float: Laplacian filtresinin varyans değeri (yüksek değer = net kenarlar/keskinlik).
     """
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def _to_gray_small(rgb: np.ndarray, size=(160, 90)) -> np.ndarray:
-    """SSIM hesabı için küçültülmüş gri tonlamalı kare üretir.
+def _to_gray_small(rgb: np.ndarray, size: tuple[int, int] = (160, 90)) -> np.ndarray:
+    """SSIM hesaplama performansını optimize etmek amacıyla küçültülmüş gri görüntü üretir.
 
-    Neden küçültüyoruz?
-      SSIM hesabı büyük görüntülerde yavaş → küçük çözünürlükte ≈ aynı sonuç,
-      çok daha hızlı hesap. 160×90 px SSIM için yeterli.
+    Args:
+        rgb (np.ndarray): (H, W, 3) boyutlu RGB renk uzayındaki piksel dizisi.
+        size (tuple[int, int], optional): Hedef (genişlik, yükseklik). Varsayılan: (160, 90).
+
+    Returns:
+        np.ndarray: Küçültülmüş gri tonlamalı uint8 matris.
     """
     small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
     return cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
 
 
 # ---------------------------------------------------------------------------
-# Aşama 1 — Aday havuzu oluşturma
+# Aşama 1 — Aday Havuzu Oluşturma
 # ---------------------------------------------------------------------------
 
 def _collect_candidates(video_path: str) -> list[_Candidate]:
-    """Videoyu bir kez tarar, her CANDIDATE_STRIDE karede bir metrik hesaplar.
+    """Videoyu akış halinde tarayarak her CANDIDATE_STRIDE adımda bir metrikleri hesaplar.
 
-    NEDEN ADAY HAVUZU?
-      Önce tüm video taranır, aday metrikler hesaplanır.
-      Sonra _select_frames() bu havuzdan en iyi 8'i seçer.
-      Bu yaklaşım videoyu sadece bir kez okur (bellek dostu).
+    Tüm videoyu belleğe yüklemeden sadece hesaplanan metrikleri ve aday kare
+    referanslarını RAM'de toplar.
 
-    Belleğe alınan şey: sadece adayların metrik değerleri + ham kare referansları
-    (tüm video karelerinin piksel verisi değil).
+    Args:
+        video_path (str): Taranacak video dosya yolu.
 
-    SSIM farkı: Her CANDIDATE_STRIDE'th kare bir öncekiyle karşılaştırılır.
-      ssim_diff = 1.0 - SSIM(önceki, şimdiki)
-      Yüksek ssim_diff → sahne değişimi olmuş → bu kare bilgilendirici
+    Returns:
+        list[_Candidate]: Değerlendirilmeye hazır aday kareler listesi.
     """
     candidates: list[_Candidate] = []
-    prev_gray = None  # SSIM için önceki küçük gri kare
+    prev_gray = None
 
     for frame in read_video_stream(video_path):
-        # Her 5. kareyi al; aradakileri atla (hız optimizasyonu)
         if frame.frame_index % CANDIDATE_STRIDE != 0:
             continue
 
-        # Tam çözünürlükte Laplacian (keskinlik), küçük çözünürlükte SSIM
-        gray_full  = cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2GRAY)
+        gray_full = cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2GRAY)
         gray_small = _to_gray_small(frame.rgb)
 
-        lap        = _laplacian_var(gray_full)
+        lap = _laplacian_var(gray_full)
         brightness = float(gray_full.mean())
 
-        # İlk kare için karşılaştırılacak önceki kare yok → diff=1.0 (en yüksek)
         diff = 1.0 if prev_gray is None else float(1.0 - ssim(prev_gray, gray_small))
 
         candidates.append(_Candidate(frame, lap, diff, brightness))
@@ -194,52 +213,44 @@ def _collect_candidates(video_path: str) -> list[_Candidate]:
 
 
 # ---------------------------------------------------------------------------
-# Aşama 2 ve 3 — Akıllı kare seçimi + fallback doldurma
+# Aşama 2 ve 3 — Akıllı Kare Seçimi ve Fallback Doldurma
 # ---------------------------------------------------------------------------
 
 def _select_frames(
     candidates: list[_Candidate],
 ) -> tuple[list[_Candidate], set[int]]:
-    """Aday havuzundan en bilgilendirici TARGET_FRAME_COUNT kareyi seçer.
+    """Aday havuzundan en bilgilendirici ve keskin kareleri seçer.
 
-    DÖNER: (seçilen_liste, fallback_fill_id_seti)
-      fallback_ids → 3. aşamada eklenen karelerin Python id()'leri
-      Bu set, build_vlm_frame_packet()'te selection_reason'ı doğru atamak için kullanılır.
+    Algoritma Aşamaları:
+        1. **Filtre:** Laplacian varyansı < MIN_SHARPNESS olan bulanık kareler elenir.
+        2. **Greedy Seçim:** Adaylar SSIM farkına göre büyükten küçüğe sıralanır. Seçilmiş
+           karelerle zaman farkı >= MIN_GAP_SEC olanlar havuza eklenir.
+        3. **Fallback Doldurma:** Yetersiz kare kaldığında zaman ekseni eşit aralıklarla
+           taranarak eksikler tamamlanır.
 
-    SEÇIM MANTIĞI (3 aşamalı):
+    Args:
+        candidates (list[_Candidate]): İncelenecek aday kare havuzu.
 
-    Aşama 1 — Bulanık filtre:
-      Laplacian varyansı < MIN_SHARPNESS olan kareler elenir.
-      Tüm kareler bulanıksa eleme yapılmaz (hiç kare kalmamasın diye).
-
-    Aşama 2 — Greedy sahne değişimi seçimi:
-      Adaylar SSIM farkına göre büyükten küçüğe sıralanır.
-      Her kare için: seçilmiş tüm karelerle zaman farkı >= MIN_GAP_SEC mi?
-        Evet → seç (zamansal çeşitlilik korunur)
-        Hayır → atla (aynı anı iki kez alma)
-
-    Aşama 3 — Fallback doldurma:
-      Hâlâ TARGET_FRAME_COUNT'a ulaşılamadıysa, zaman ekseninde eşit aralıklı
-      adaylar eklenir. Bunlar selection_reason="fallback_fill" alır.
+    Returns:
+        tuple[list[_Candidate], set[int]]:
+            - Seçilen TARGET_FRAME_COUNT adet aday kare listesi (kronolojik sırada).
+            - Fallback doldurma ile seçilen adayların Python nesne kimlikleri (`id`) kümesi.
     """
-    # Bulanık kareleri ele; tümü bulanıksa hiç eleme yapma
-    sharp  = [c for c in candidates if c.laplacian_var >= MIN_SHARPNESS] or candidates
+    # Bulanık kareleri filtrele; hepsi bulanıksa filtreyi gevşet
+    sharp = [c for c in candidates if c.laplacian_var >= MIN_SHARPNESS] or candidates
     ranked = sorted(sharp, key=lambda c: c.ssim_diff, reverse=True)
 
     selected: list[_Candidate] = []
     for c in ranked:
         if len(selected) >= TARGET_FRAME_COUNT:
             break
-        # Zaman boşluğu kontrolü: seçilmiş tüm karelerden MIN_GAP_SEC uzakta mı?
-        if all(abs(c.frame.timestamp_sec - s.frame.timestamp_sec) >= MIN_GAP_SEC
-               for s in selected):
+        if all(abs(c.frame.timestamp_sec - s.frame.timestamp_sec) >= MIN_GAP_SEC for s in selected):
             selected.append(c)
 
-    fallback_ids: set[int] = set()  # Aşama 3'te eklenen karelerin id'leri
+    fallback_ids: set[int] = set()
 
     if len(selected) < TARGET_FRAME_COUNT:
         remaining = TARGET_FRAME_COUNT - len(selected)
-        # Zaman sırasına diz, eşit aralıklarla örnekle
         pool = sorted(candidates, key=lambda c: c.frame.timestamp_sec)
         selected_indices = {id(s) for s in selected}
         if pool:
@@ -251,107 +262,95 @@ def _select_frames(
                 if id(cand) not in selected_indices:
                     selected.append(cand)
                     selected_indices.add(id(cand))
-                    fallback_ids.add(id(cand))  # bu kare fallback ile geldi
+                    fallback_ids.add(id(cand))
 
-    # Son sıralama: grid soldan-sağa zaman sırasında olsun
+    # Grid montajı için kareleri kronolojik (zaman sırasına) diz
     selected.sort(key=lambda c: c.frame.timestamp_sec)
     return selected[:TARGET_FRAME_COUNT], fallback_ids
 
 
 # ---------------------------------------------------------------------------
-# Aşama 4 — Düşük ışık iyileştirme
+# Aşama 4 — Koşullu CLAHE Kontrast İyileştirmesi
 # ---------------------------------------------------------------------------
 
 def _apply_clahe_if_needed(rgb: np.ndarray, brightness: float) -> tuple[np.ndarray, bool]:
-    """Sadece karanlık karelerde CLAHE (Kontrast Sınırlı Adaptif Histogram Eşitleme) uygular.
+    """Yalnızca karanlık karelerde LAB renk uzayının L kanalına CLAHE uygular.
 
-    NEDEN KOŞULLU?
-      Parlak karelere CLAHE uygulamak görüntüyü bozar (aşırı kontrast).
-      Yalnızca brightness < LOW_LIGHT_BRIGHTNESS olan kareler işlenir.
+    Aydınlık karelerde aşırı doygunluğu ve gürültüyü önlemek amacıyla işlem yapılmaz.
 
-    CLAHE NEDİR?
-      LAB renk uzayının L (parlaklık) kanalına histogram eşitleme uygular.
-      A ve B kanalları (renk) değişmez → renk bozulması olmaz.
-      clip_limit: lokal kontrast artışını sınırlar, gürültüyü bastırır.
-      tileGridSize: görüntüyü kaç bölgeye bölerek işleneceği.
+    Args:
+        rgb (np.ndarray): (H, W, 3) RGB renk uzayındaki görüntü matrisi.
+        brightness (float): Karenin ortalama parlaklık değeri.
 
-    Döner: (işlenmiş_rgb, clahe_uygulandı_mı)
+    Returns:
+        tuple[np.ndarray, bool]: (İyileştirilmiş RGB matrisi, CLAHE uygulandı mı bayrağı).
     """
     if brightness >= LOW_LIGHT_BRIGHTNESS:
-        return rgb, False  # yeterince parlak, değiştirme
+        return rgb, False
 
-    # RGB → LAB dönüşümü (L=parlaklık, A ve B renk kanalları)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
 
-    # Sadece L kanalına CLAHE uygula
     clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
     l2 = clahe.apply(l)
 
-    # L kanalını geri birleştir, LAB → RGB'ye çevir
     enhanced = cv2.merge((l2, a, b))
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2RGB), True
 
 
 # ---------------------------------------------------------------------------
-# Aşama 5 — Grid montajı
+# Aşama 5 — Grid Montajı
 # ---------------------------------------------------------------------------
 
 def _build_grid(frames_rgb: list[np.ndarray]) -> np.ndarray:
-    """Seçilen kareleri tek bir ızgara (grid) görseline birleştirir.
+    """Seçilen kareleri tek bir mozaik (grid) matrisinde birleştirir.
 
-    NEDEN GRİD?
-      VLM'e 8 ayrı görüntü yerine tek bir grid görseli gönderilir:
-        - Tek HTTP/inference çağrısı → daha hızlı
-        - Model tüm zaman dilimini bir arada görür → bağlamsal analiz daha iyi
-        - Grid düzeni: GRID_COLS sütun × GRID_ROWS satır
+    Eksik kareler bulunması durumunda (çok kısa videolar) boş hücreler siyah
+    pikseller ile doldurulur.
 
-    Eksik kare varsa (video çok kısaysa) siyah hücrelerle doldurulur.
+    Args:
+        frames_rgb (list[np.ndarray]): Grid'e yerleştirilecek kareler listesi.
 
-    Çıktı boyutu: (CELL_SIZE[1]*GRID_ROWS) × (CELL_SIZE[0]*GRID_COLS) piksel
-    Örnek: 384×384 hücre, 2×4 grid → 768×1536 piksel toplam grid
+    Returns:
+        np.ndarray: (GRID_ROWS * CELL_SIZE[1], GRID_COLS * CELL_SIZE[0], 3) boyutlu birleşik matris.
     """
-    # Her kareyi CELL_SIZE'a yeniden boyutlandır (INTER_AREA: küçültme için ideal)
     cells = [cv2.resize(f, CELL_SIZE, interpolation=cv2.INTER_AREA) for f in frames_rgb]
 
-    # Eksik hücreleri siyah ile doldur
     while len(cells) < GRID_ROWS * GRID_COLS:
         cells.append(np.zeros((CELL_SIZE[1], CELL_SIZE[0], 3), dtype=np.uint8))
 
-    # Satırları yatay birleştir, sonra satırları dikey birleştir
-    rows = [np.hstack(cells[r * GRID_COLS:(r + 1) * GRID_COLS]) for r in range(GRID_ROWS)]
+    rows = [np.hstack(cells[r * GRID_COLS : (r + 1) * GRID_COLS]) for r in range(GRID_ROWS)]
     return np.vstack(rows)
 
 
 # ---------------------------------------------------------------------------
-# Ana giriş noktası — pipeline.py bu fonksiyonu çağırır
+# Grid Modu Ana Giriş Noktası (S1b Paketi Üreticisi)
 # ---------------------------------------------------------------------------
 
 def build_vlm_frame_packet(video_path: str, video_id: str, output_dir: str) -> VLMFramePacket:
-    """Uçtan uca ön işleme: video dosyası → S1b sözleşme paketi.
+    """Uçtan uca grid ön işleme akışını yürüterek S1b sözleşme paketini üretir.
 
-    ADIMLAR:
-      1. Aday havuzu oluştur (_collect_candidates)
-      2. En iyi kareleri seç (_select_frames) — fallback_ids'i de al
-      3. Her kareye CLAHE uygula (gerekiyorsa)
-      4. Her kare için FrameMeta oluştur (selection_reason dahil)
-      5. Kareleri grid'e diz (_build_grid)
-      6. Grid JPEG'ini diske yaz
-      7. VLMFramePacket (S1b) oluştur ve döndür
+    1. Aday kareleri toplar ve metrikleri hesaplar.
+    2. Keskinlik ve sahne değişimlerine göre en iyi TARGET_FRAME_COUNT kareyi seçer.
+    3. Gerekli karelere CLAHE uygular.
+    4. Kareleri 2x4 mozaik JPEG görseline birleştirir ve diske kaydeder.
+    5. :class:`contracts.VLMFramePacket` nesnesini oluşturup döndürür.
 
-    selection_reason ataması (S7 değişikliği):
-      "fallback_fill"  → aşama 3'te zaman ekseninden dolduruldu
-      "scene_change"   → SSIM farkı >= 0.15 (sahne değişimi)
-      "uniform_sample" → SSIM farkı < 0.15 (tekrarlı ama seçildi)
-      "motion_peak"    → ileride optik akış eklendiğinde kullanılacak
+    Args:
+        video_path (str): Kaynak video dosyası.
+        video_id (str): Video kimliği.
+        output_dir (str): Grid JPEG dosyasının kaydedileceği klasör.
 
-    Çıktı: VLMFramePacket → backend.py'nin infer() metoduna gönderilir.
+    Returns:
+        VLMFramePacket: VLM backend'e sunulmaya hazır S1b paketi.
+
+    Raises:
+        ValueError: Videodan hiçbir kare okunamazsa.
     """
     candidates = _collect_candidates(video_path)
     if not candidates:
         raise ValueError("Video karesi okunamadı (boş ya da bozuk dosya olabilir).")
 
-    # S7: _select_frames artık fallback_ids de döndürüyor
     selected, fallback_ids = _select_frames(candidates)
 
     enhanced_rgb: list[np.ndarray] = []
@@ -359,24 +358,21 @@ def build_vlm_frame_packet(video_path: str, video_id: str, output_dir: str) -> V
     frame_metas: list[FrameMeta] = []
 
     for i, c in enumerate(selected):
-        # CLAHE uygula (karanlık ise), sonucu listeye ekle
         rgb, used_clahe = _apply_clahe_if_needed(c.frame.rgb, c.brightness)
         clahe_used_any = clahe_used_any or used_clahe
         enhanced_rgb.append(rgb)
 
-        # S7: Seçilme nedenini doğru belirle (3 dalil karar)
         if id(c) in fallback_ids:
-            reason = "fallback_fill"    # zaman ekseni doldurma ile geldi
+            reason = "fallback_fill"
         elif c.ssim_diff >= 0.15:
-            reason = "scene_change"     # SSIM farkı yüksek → sahne değişimi
+            reason = "scene_change"
         else:
-            reason = "uniform_sample"   # SSIM farkı düşük ama seçildi
-        # "motion_peak" → optik akış eklendiğinde buraya eklenecek
+            reason = "uniform_sample"
 
         frame_metas.append(FrameMeta(
             frame_index=c.frame.frame_index,
             timestamp_sec=c.frame.timestamp_sec,
-            grid_position=i,           # grid'deki pozisyonu (0=sol üst)
+            grid_position=i,
             selection_reason=reason,
             quality=FrameQualityMetrics(
                 laplacian_var=c.laplacian_var,
@@ -385,21 +381,21 @@ def build_vlm_frame_packet(video_path: str, video_id: str, output_dir: str) -> V
             ),
         ))
 
-    # Grid görselini oluştur ve diske yaz (JPEG, %92 kalite)
     grid_img = _build_grid(enhanced_rgb)
     os.makedirs(output_dir, exist_ok=True)
-    packet_id = str(uuid.uuid4())  # benzersiz paket kimliği
+    packet_id = str(uuid.uuid4())
     grid_path = os.path.join(output_dir, f"{packet_id}_grid.jpg")
 
-    # RGB → BGR dönüşümü gerekli: cv2.imwrite BGR formatında yazar
-    cv2.imwrite(grid_path, cv2.cvtColor(grid_img, cv2.COLOR_RGB2BGR),
-                [cv2.IMWRITE_JPEG_QUALITY, 92])
+    cv2.imwrite(
+        grid_path,
+        cv2.cvtColor(grid_img, cv2.COLOR_RGB2BGR),
+        [cv2.IMWRITE_JPEG_QUALITY, 92],
+    )
 
-    # S1b paketini oluştur ve döndür → backend.py bunu alacak
     return VLMFramePacket(
         video_id=video_id,
-        source_start_sec=selected[0].frame.timestamp_sec,   # seçilen ilk kare
-        source_end_sec=selected[-1].frame.timestamp_sec,     # seçilen son kare
+        source_start_sec=selected[0].frame.timestamp_sec,
+        source_end_sec=selected[-1].frame.timestamp_sec,
         frames=frame_metas,
         grid_layout=GridLayout(rows=GRID_ROWS, cols=GRID_COLS, cell_size=CELL_SIZE),
         enhancement=EnhancementInfo(
@@ -413,80 +409,70 @@ def build_vlm_frame_packet(video_path: str, video_id: str, output_dir: str) -> V
 
 
 # ===========================================================================
-# VİDEO MODU ÖN İŞLEME — sahne sınırı bulma + 720p/60sn segment üretimi
+# VİDEO MODU ÖN İŞLEME — Sahne Kesimi ve 720p/60sn Segment Üretimi
 # ===========================================================================
-#
-# NEDEN İKİNCİ BİR ÖN İŞLEME YOLU?
-#   Yukarıdaki grid yolu (build_vlm_frame_packet) videoyu 8 kareye indirger.
-#   Bu, görüntü-only modeller için gerekliydi. Buna karşılık TEKNOFEST EVREN
-#   servisinde video analizine özelleşmiş bir model (alias "vlm") bulunur ve
-#   videoyu doğrudan kabul eder (2.0 fps örnekleme, 520 kareye kadar). Videoyu
-#   bütün olarak göndermek, 8 karelik mozaikten belirgin şekilde daha iyi
-#   zamansal bağlam sağlar.
-#
-# İKİ SERT KISIT:
-#   1. Çözünürlük: 720p. Kodlayıcının piksel bütçesi videonun TAMAMI için tek
-#      bir toplamdır; 720p yükleme 77 saniyeden sonra orantılı olarak
-#      küçültülür. Yani 720p üstüne çıkmak kazanç sağlamaz.
-#   2. Süre: segment başına en fazla 60 saniye. Daha uzun videolar segmentlere
-#      bölünüp SIRAYLA incelenir; segmentler arası bağlam metin tabanlı
-#      hafızayla (contracts.VideoAnalysisMemory) taşınır. Böylece bağlam
-#      penceresi segment sayısıyla büyümez.
 
-from fractions import Fraction
+#: Sahne değişimi eşiği: (1.0 - SSIM) bu değeri aşarsa kesim adayı kabul edilir
+SCENE_SSIM_THRESHOLD: float = _CFG.get("scene_ssim_threshold", 0.30)
 
-import av
+#: Bir segmentin sahip olabileceği asgari süre (saniye)
+SCENE_MIN_SEGMENT_SEC: float = _CFG.get("scene_min_segment_sec", 15.0)
 
-from contracts import format_mmss
+#: Segment üst sınırı — EVREN video kısıtı (720p için azami 60 saniye)
+SCENE_MAX_SEGMENT_SEC: float = _CFG.get("scene_max_segment_sec", 60.0)
 
-# Sahne değişimi eşiği: 1-SSIM bu değeri aşarsa kesim adayı sayılır.
-SCENE_SSIM_THRESHOLD = _CFG.get("scene_ssim_threshold", 0.30)
-# Bir segment en az bu kadar uzun olmalı (çok kısa segment bağlamsız kalır).
-SCENE_MIN_SEGMENT_SEC = _CFG.get("scene_min_segment_sec", 15.0)
-# Segment üst sınırı — EVREN video kısıtı (720p için 60 sn).
-SCENE_MAX_SEGMENT_SEC = _CFG.get("scene_max_segment_sec", 60.0)
-# SSIM her kaç karede bir hesaplanır (hız/hassasiyet dengesi).
-SCENE_DETECT_STRIDE = _CFG.get("scene_detect_stride", 5)
-# Segment klipleri bu yüksekliğe indirilir (720p kısıtı).
-VLM_MAX_HEIGHT = _CFG.get("vlm_max_height", 720)
-# x264 kalite/hız ayarı — kalite ile dosya boyutu dengesi.
-VLM_CLIP_CRF = _CFG.get("vlm_clip_crf", 23)
-VLM_CLIP_PRESET = _CFG.get("vlm_clip_preset", "veryfast")
+#: Sahne değişim taramasında kaç karede bir SSIM hesaplanacağı
+SCENE_DETECT_STRIDE: int = _CFG.get("scene_detect_stride", 5)
+
+#: Segment klipleri için hedef azami dikey piksel çözünürlüğü (720p kısıtı)
+VLM_MAX_HEIGHT: int = _CFG.get("vlm_max_height", 720)
+
+#: H.264 video kodlama CRF (kalite) ve hız ön ayarları
+VLM_CLIP_CRF: int = _CFG.get("vlm_clip_crf", 23)
+VLM_CLIP_PRESET: str = _CFG.get("vlm_clip_preset", "veryfast")
 
 
 @dataclass
 class VideoClip:
-    """VLM'e gönderilmeye hazır tek bir video parçası.
+    """VLM servisine doğrudan gönderilmeye hazır tek bir video parçasını temsil eder.
 
-    ``reencoded=False`` ise dosya özgün videonun kendisidir (kısıtlara zaten
-    uyduğu için yeniden kodlanmamıştır); bu durumda dosya **silinmemelidir**.
+    Attributes:
+        path (str): Klip MP4 dosyasının mutlak dosya yolu.
+        start_sec (float): Orijinal tam videodaki mutlak başlangıç saniyesi.
+        end_sec (float): Orijinal tam videodaki mutlak bitiş saniyesi.
+        index (int): Segmentin kronolojik sıra indeksi (0-tabanlı).
+        reencoded (bool): Dosyanın geçici olarak yeniden kodlanıp kodlanmadığı.
+            False ise orijinal dosyanın kendisidir ve silinmemelidir.
     """
-    path: str                  # gönderilecek mp4 dosyasının yolu
-    start_sec: float           # tam videodaki mutlak başlangıç
-    end_sec: float             # tam videodaki mutlak bitiş
-    index: int = 0             # segment sırası (0'dan başlar)
-    reencoded: bool = False    # geçici dosya mı (True ise temizlenebilir)
+    path: str
+    start_sec: float
+    end_sec: float
+    index: int = 0
+    reencoded: bool = False
 
     @property
     def duration_sec(self) -> float:
-        """Klip süresi (saniye)."""
+        """Klip süresini saniye cinsinden döndürür."""
         return max(0.0, self.end_sec - self.start_sec)
 
     @property
     def time_label(self) -> str:
-        """İnsan okunur ``MM:SS-MM:SS`` etiketi."""
+        """Klibin 'MM:SS-MM:SS' formatındaki zaman aralığı etiketi."""
         return f"{format_mmss(self.start_sec)}-{format_mmss(self.end_sec)}"
 
 
-def probe_video(video_path: str) -> dict:
-    """Videonun temel özelliklerini okur (kod çözmeden, container meta verisinden).
+def probe_video(video_path: str) -> dict[str, Any]:
+    """Video dosyasını decode etmeden hızlıca konteyner meta verilerini okur.
 
     Args:
-        video_path: İncelenecek video dosyası.
+        video_path (str): İncelenecek video dosyası yolu.
 
     Returns:
-        ``width``, ``height``, ``fps``, ``duration_sec`` anahtarlı sözlük.
-        Süre meta veriden okunamazsa kare sayısı/fps ile tahmin edilir.
+        dict[str, Any]: `width`, `height`, `fps`, `duration_sec` değerlerini içeren sözlük.
+
+    Raises:
+        FileNotFoundError: Video dosyası mevcut değilse.
+        av.AVError: Video akışı okunamıyorsa.
     """
     with av.open(video_path) as container:
         stream = container.streams.video[0]
@@ -515,26 +501,24 @@ def detect_scene_boundaries(
     max_segment_sec: float | None = None,
     stride: int | None = None,
 ) -> list[tuple[float, float]]:
-    """Videoyu sahne değişimlerinden yararlanarak segment aralıklarına böler.
+    """Videoyu görsel sahne geçişlerinden faydalanarak zaman aralıklarına böler.
 
-    Kesim noktaları rastgele değil, görüntünün gerçekten değiştiği anlardır;
-    böylece bir olay iki segmentin ortasından bölünme olasılığı azalır. Ancak
-    sahne değişimi beklenirken segmentin sonsuza uzamasına izin verilmez:
-    ``max_segment_sec`` sert bir tavandır (EVREN'in video kısıtı).
+    Kesim anları rastgele zamanlar yerine görsel kompozisyonun değiştiği anlara
+    denk getirilir; böylece bir olayın ortadan ikiye bölünmesi engellenir.
+    Ancak `max_segment_sec` sert bir tavan olarak korunur.
 
     Args:
-        video_path: Bölünecek video.
-        ssim_threshold: ``1-SSIM`` bu değeri aşarsa sahne değişimi sayılır.
-            ``None`` ise config değeri kullanılır.
-        min_segment_sec: Bir segmentin asgari süresi; bu süreden önce gelen
-            sahne değişimleri kesim için kullanılmaz.
-        max_segment_sec: Segment üst sınırı; sahne değişimi bulunmasa da bu
-            sürede kesilir.
-        stride: SSIM'in kaç karede bir hesaplanacağı.
+        video_path (str): Bölünecek video dosya yolu.
+        ssim_threshold (float | None, optional): 1-SSIM sahne değişim eşiği. None ise config kullanılır.
+        min_segment_sec (float | None, optional): Asgari segment süresi (sn). None ise config kullanılır.
+        max_segment_sec (float | None, optional): Azami segment süresi (sn). None ise config kullanılır.
+        stride (int | None, optional): Kaç karede bir SSIM hesaplanacağı. None ise config kullanılır.
 
     Returns:
-        ``(start_sec, end_sec)`` ikilileri; boşluksuz ve sıralı olarak videonun
-        tamamını kaplar. Video zaten sınırın altındaysa tek elemanlı liste.
+        list[tuple[float, float]]: Sıralı `(start_sec, end_sec)` zaman aralıkları listesi.
+
+    Raises:
+        ValueError: Video süresi tespit edilemezse.
     """
     ssim_threshold = SCENE_SSIM_THRESHOLD if ssim_threshold is None else ssim_threshold
     min_segment_sec = SCENE_MIN_SEGMENT_SEC if min_segment_sec is None else min_segment_sec
@@ -545,11 +529,11 @@ def detect_scene_boundaries(
     if duration <= 0:
         raise ValueError(f"Video süresi belirlenemedi: {video_path}")
 
-    # Tek segmente sığıyorsa video hiç taranmaz (gereksiz iş yapılmaz).
+    # Video zaten azami süre sınırının altındaysa bölme işlemi yapılmaz
     if duration <= max_segment_sec:
         return [(0.0, duration)]
 
-    # Sahne değişimi anlarını topla.
+    # Sahne değişimi zaman damgalarını topla
     changes: list[float] = []
     prev_gray = None
     for frame in read_video_stream(video_path):
@@ -561,14 +545,13 @@ def detect_scene_boundaries(
                 changes.append(frame.timestamp_sec)
         prev_gray = gray
 
-    # Zaman eksenini yürüyerek segmentleri kur.
+    # Zaman çizelgesini yürüyerek segment sınırlarını belirle
     segments: list[tuple[float, float]] = []
     start = 0.0
     cursor = 0
     while start < duration - 1e-6:
         hard_end = min(start + max_segment_sec, duration)
 
-        # min_segment_sec'ten önceki değişimleri atla (çok kısa segment olmasın).
         while cursor < len(changes) and changes[cursor] <= start + min_segment_sec:
             cursor += 1
 
@@ -581,8 +564,7 @@ def detect_scene_boundaries(
         segments.append((start, end))
         start = end
 
-    # Çok kısa kalan son segmenti öncekine kat — ama YALNIZCA üst sınır
-    # aşılmıyorsa; 60 sn kısıtı pazarlık konusu değildir.
+    # Çok kısa kalan son segmenti bir öncekine dahil et (üst sınır aşılmıyorsa)
     if len(segments) >= 2:
         last_start, last_end = segments[-1]
         if (last_end - last_start) < min_segment_sec:
@@ -601,24 +583,25 @@ def extract_video_segment(
     out_path: str,
     max_height: int | None = None,
 ) -> str:
-    """Videonun bir aralığını kesip 720p'ye indirerek yeni bir mp4 yazar.
+    """Videonun belirli bir aralığını keser, 720p'ye ölçeklendirir ve yeni MP4 olarak kaydeder.
 
-    Yeniden kodlama gerekir çünkü hem kırpma hem ölçekleme yapılır; akış
-    kopyalama (remux) yalnızca anahtar kare sınırlarında kesebildiği için
-    istenen başlangıç anını tutturamaz.
+    Donanım Hızlandırma Desteği:
+        Sistemde NVIDIA GPU ve FFmpeg NVENC desteği (`h264_nvenc`) mevcutsa donanım
+        hızlandırma ile çok hızlı kodlama yapılır; bulunamazsa standart CPU `libx264`
+        kodlayıcısına güvenli fallback yapılır.
 
     Args:
-        video_path: Kaynak video.
-        start_sec: Kesimin başlangıcı (saniye).
-        end_sec: Kesimin bitişi (saniye).
-        out_path: Yazılacak mp4 dosyası.
-        max_height: Hedef azami yükseklik; ``None`` ise config değeri (720).
+        video_path (str): Kaynak video dosyası yolu.
+        start_sec (float): Kesimin başlangıç saniyesi.
+        end_sec (float): Kesimin bitiş saniyesi.
+        out_path (str): Üretilecek MP4 klibinin kayıt yolu.
+        max_height (int | None, optional): Hedef azami dikey çözünürlük (varsayılan: 720).
 
     Returns:
-        Yazılan dosyanın yolu (``out_path``).
+        str: Kaydedilen klibin dosya yolu (`out_path`).
 
     Raises:
-        ValueError: Aralıkta hiç kare bulunamazsa.
+        ValueError: Belirtilen zaman aralığında hiç kare bulunamazsa.
     """
     max_height = VLM_MAX_HEIGHT if max_height is None else max_height
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -632,19 +615,16 @@ def extract_video_segment(
         rate = istream.average_rate or Fraction(25, 1)
         time_base = float(istream.time_base) if istream.time_base else 1.0
 
-        # 720p'ye indir; yuv420p çift boyut gerektirdiği için aşağı yuvarla.
         scale = min(1.0, max_height / in_h) if in_h else 1.0
         out_w = max(2, (int(in_w * scale) // 2) * 2)
         out_h = max(2, (int(in_h * scale) // 2) * 2)
 
-        # Başlangıca yaklaş (anahtar kareye), kalan farkı kare atlayarak kapat.
         if start_sec > 0 and time_base:
             try:
                 inp.seek(int(start_sec / time_base), stream=istream)
             except av.AVError:
                 inp.seek(0)
 
-        # GPU NVENC donanım hızlandırma (NVIDIA), desteklenmezse CPU libx264 fallback
         codec_name = "libx264"
         codec_opts = {"crf": str(VLM_CLIP_CRF), "preset": VLM_CLIP_PRESET}
         try:
@@ -669,6 +649,7 @@ def extract_video_segment(
             except Exception:
                 ostream = out.add_stream("libx264", rate=rate)
                 ostream.options = {"crf": str(VLM_CLIP_CRF), "preset": VLM_CLIP_PRESET}
+
             ostream.width = out_w
             ostream.height = out_h
             ostream.pix_fmt = "yuv420p"
@@ -685,8 +666,6 @@ def extract_video_segment(
                     break
 
                 new_frame = frame.reformat(width=out_w, height=out_h, format="yuv420p")
-                # Zaman damgasını segment başlangıcına göre sıfırla; klip kendi
-                # içinde 0'dan başlar, mutlak zaman prompt'ta ayrıca bildirilir.
                 new_frame.pts = int(round((t - start_sec) / float(ostream.time_base)))
                 new_frame.time_base = ostream.time_base
 
@@ -694,7 +673,7 @@ def extract_video_segment(
                     out.mux(packet)
                 written += 1
 
-            for packet in ostream.encode():  # kodlayıcıyı boşalt
+            for packet in ostream.encode():
                 out.mux(packet)
         finally:
             out.close()
@@ -714,29 +693,29 @@ def prepare_video_segments(
     ssim_threshold: float | None = None,
     min_segment_sec: float | None = None,
 ) -> list[VideoClip]:
-    """Videoyu EVREN ``vlm`` modeline gönderilmeye hazır kliplere dönüştürür.
+    """Videoyu EVREN `vlm` modeline gönderilmeye hazır :class:`VideoClip` parçalarına dönüştürür.
 
-    Karar mantığı:
-
-    * Video hem süre hem çözünürlük kısıtına **zaten uyuyorsa** yeniden
-      kodlanmaz; özgün dosya olduğu gibi kullanılır. Bu hem zaman kazandırır
-      hem de ön ek önbelleği (prefix cache) açısından önemlidir: baytlar
-      değişmediği sürece aynı video üzerinden sorulan takip soruları
-      önbellekten yararlanır.
-    * Aksi hâlde video :func:`detect_scene_boundaries` ile segmentlere bölünür
-      ve her segment 720p'ye indirilerek ayrı bir mp4 olarak yazılır.
+    Optimizasyon Mantığı:
+        - Video süre (<= 60 sn) ve çözünürlük (<= 720p) kriterlerine zaten uyuyorsa,
+          dosya kesinlikle yeniden kodlanmaz (`reencoded=False`). Bu sayede hem zaman
+          kaybı önlenir hem de aynı videoya yapılacak sorgularda VLM sunucusunun
+          ön ek önbelleği (prefix caching) tam isabetle çalışır.
+        - Kriterleri aşan videolar ise sahne sınırlarından bölünerek her parça 720p
+          H.264 klibi olarak dışa aktarılır (`reencoded=True`).
 
     Args:
-        video_path: Kaynak video.
-        output_dir: Segment kliplerinin yazılacağı klasör.
-        max_segment_sec: Segment süre tavanı (varsayılan 60).
-        max_height: Çözünürlük tavanı (varsayılan 720).
-        ssim_threshold: Sahne değişimi eşiği.
-        min_segment_sec: Segment asgari süresi.
+        video_path (str): Kaynak video dosyası.
+        output_dir (str): Segment MP4 kliplerinin kaydedileceği dizin.
+        max_segment_sec (float | None, optional): Azami segment süresi. None ise config: 60.0.
+        max_height (int | None, optional): Azami dikey çözünürlük. None ise config: 720.
+        ssim_threshold (float | None, optional): Sahne kesim SSIM eşiği.
+        min_segment_sec (float | None, optional): Asgari segment süresi.
 
     Returns:
-        Zaman sırasında :class:`VideoClip` listesi. Tek parça yeterliyse tek
-        elemanlı ve ``reencoded=False`` olur.
+        list[VideoClip]: Zaman sırasına göre sıralanmış klip listesi.
+
+    Raises:
+        ValueError: Video süresi hesaplanamazsa.
     """
     max_segment_sec = SCENE_MAX_SEGMENT_SEC if max_segment_sec is None else max_segment_sec
     max_height = VLM_MAX_HEIGHT if max_height is None else max_height

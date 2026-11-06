@@ -1,33 +1,87 @@
+"""
+Kanal B - Görsel Dil Modeli (VLM) Çıkarım Arka Yüzü (vlm_backend.py)
+==================================================================
+
+Bu modül, Görsel Dil Modelleri (Vision-Language Models / Multimodal LLM) ile
+iletişim kurarak video ve görsel paketlerini semantik sahne yorumlarına ve yapılandırılmış
+İSG risk analizlerine (S8 Sözleşmesi) dönüştürür.
+
+Mimari Tasarım ve Desenler:
+---------------------------
+1. **Adaptör Deseni (Adapter Pattern):**
+   - :class:`VLMBackendBase` soyut taban sınıfı, tüm çıkarım motorları için standart bir
+     arayüz tanımlar (`infer()` ve `_raw_infer()`).
+   - Farklı altyapılar (TEKNOFEST EVREN Server, vLLM, llama.cpp, HuggingFace Transformers)
+     ortak arayüz arkasında şeffafça değiştirilebilir.
+
+2. **Çift Mod Desteği (Video ve Grid):**
+   - **Video Modu (:meth:`ServerBackend.infer_video`):** TEKNOFEST EVREN `vlm` alias'ı
+     üzerinden MP4 video klipleri doğrudan gönderilir. Zamansal akış ve hareket analizi
+     yüksek doğrulukla yapılır.
+   - **Grid Modu (:meth:`VLMBackendBase.infer`):** Görsel tabanlı yerel modeller için
+     kare mozaiği (S1b paketi) üzerinden tek HTTP çağrısıyla çıkarım sağlanır.
+
+3. **3 Kademeli Güvenli JSON Ayrıştırıcı ve Düşünce İzi Ayrımı:**
+   - Qwen2.5-VL gibi akıl yürüten (reasoning) modellerin `<think>...</think>` blokları
+     ayrıştırılarak `reasoning_trace` alanına aktarılır; JSON gövdesinden temizlenir.
+   - Model çıktısı tam JSON, Markdown blokları (```json) veya greedy süslü parantez
+     aramasıyla 3 kademede çözülür. Hata durumunda sistem çökmez, S8 sözleşmesi korunur.
+
+4. **Bağımsız Güven Skoru (:func:`_compute_confidence`):**
+   - Yalnızca modelin kendi öz güven beyanına (`confidence_overall`) güvenmek yerine;
+     parse başarısı, risk şiddeti ağırlıklandırması ve görsel kanıt sayısı
+     (supporting frame count) birleştirilerek kalibre edilmiş bir güven skoru üretilir.
+"""
 
 from __future__ import annotations
+
 import base64
 import json
 import os
 import re
 import time
 from abc import ABC, abstractmethod
+from typing import Any
 
 import requests
 
-# S1b ve S8 sözleşme yapıları
-from contracts import (
-    VLMInterpretation, DetectedEntity, InferenceMetrics, VLMFramePacket,
-    RiskEvent, format_mmss,
-)
+# Paket içi veya doğrudan dizin çalıştırma uyumlu esnek importlar
+try:
+    from .contracts import (
+        DetectedEntity,
+        InferenceMetrics,
+        RiskEvent,
+        VLMFramePacket,
+        VLMInterpretation,
+        format_mmss,
+    )
+except ImportError:
+    from contracts import (
+        DetectedEntity,
+        InferenceMetrics,
+        RiskEvent,
+        VLMFramePacket,
+        VLMInterpretation,
+        format_mmss,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Sistem Promptu — model davranışını yönlendiren temel talimat
+# Grid Modu Sistem Promptu Üreticisi
 # ---------------------------------------------------------------------------
 
 def build_system_prompt(rows: int, cols: int) -> str:
-    """Grid boyutuna göre dinamik sistem promptu üretir.
+    """Grid matris boyutlarına göre dinamik VLM sistem promptu üretir.
 
-    NEDEN DİNAMİK?
-      Önceki SYSTEM_PROMPT sabit "2×4 grid için 0-7" içeriyordu.
-      Ancak grid boyutu config.yaml'dan değişebilir (ör. 3×3 = 9 hücre).
-      Bu fonksiyon rows/cols'u packet.grid_layout'tan alarak doğru
-      hücre sayısını ve indeks aralığını prompt'a enjekte eder.
+    Hücre sayısını ve indeks sınırlarını (`rows * cols`) dinamik olarak enjekte
+    ederek modelin doğru ızgara konumlarına atıfta bulunmasını sağlar.
+
+    Args:
+        rows (int): Grid görselindeki satır adedi.
+        cols (int): Grid görselindeki sütun adedi.
+
+    Returns:
+        str: Modele gönderilecek İngilizce sistem promptu metni.
     """
     total_cells = rows * cols
     max_idx = total_cells - 1
@@ -69,61 +123,52 @@ def build_system_prompt(rows: int, cols: int) -> str:
         f"supporting_frame_count: in how many grid cells you saw this risk (0-{total_cells}). "
         f"supporting_frame_positions: grid indices where the risk is visible (0=top-left, left-to-right, max={max_idx}). "
         "confidence: your risk-specific confidence (0.0-1.0)."
-        # NEDEN YENİ ŞEMA?
-        # Önceki risk_flags_tr (düz string listesi) hangi riskin ne kadar kritik
-        # olduğunu ve kaç karede görüldüğünü Karar Ajanı'na söylemiyordu.
-        # risk_events ile her risk artık severity + kanıt bilgisiyle taşınır.
-        # Dil İngilizce: VLM'ler İngilizce talimatla daha tutarlı JSON üretiyor
-        # (main dalındaki "ingilizceye çevrildi" değişikliği korundu).
     )
 
 
 # ---------------------------------------------------------------------------
-# Yardımcı fonksiyonlar
+# Yardımcı Fonksiyonlar ve JSON / Reasoning Ayrıştırıcılar
 # ---------------------------------------------------------------------------
 
 def _encode_jpeg_b64(image_path: str) -> str:
-    """Grid JPEG görselini base64 string'e dönüştürür.
+    """Diskteki JPEG grid görselini Base64 formatına kodlar.
 
-    Neden base64?
-      OpenAI-uyumlu API'ler görsel veriyi data URI formatında bekler:
-      "data:image/jpeg;base64,{b64}" → HTTP request body'sine gömülür.
+    Args:
+        image_path (str): Görselin mutlak dosya yolu.
+
+    Returns:
+        str: Base64 kodlanmış ASCII metin.
     """
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def _extract_json(text: str) -> dict:
-    """VLM'in ham metin çıktısından JSON bloğunu çıkarır ve parse eder.
+def _extract_json(text: str) -> dict[str, Any]:
+    """Modelin metin çıktısından JSON bloğunu 3 kademeli stratejiyle ayıklar ve parse eder.
 
-    NOT: Bu fonksiyon <think>...</think> bloğu çıkarıldıktan sonraki metni alır.
-    Bkz. _extract_reasoning_and_json() — reasoning parse için üst düzey fonksiyon.
+    Kademeler:
+        1. Kademe: Doğrudan `json.loads()` (en temiz durum).
+        2. Kademe: Markdown kod bloğu (` ```json { ... } ``` `) regex yakalama.
+        3. Kademe: Metindeki en dış `{ ... }` süslü parantezlerini greedy yakalama.
 
-    3 kademeli strateji — Model farklı formatlarda yanıt üretebilir:
+    Args:
+        text (str): Modelden gelen ham metin (reasoning etiketleri temizlenmiş).
 
-    1. Kademe — Direkt parse (en hızlı):
-       Model tam ve düzgün JSON ürettiyse doğrudan json.loads() çalışır.
-       Örnek: {"scene_summary_tr": "...", ...}
+    Returns:
+        dict[str, Any]: Ayrıştırılmış JSON sözlüğü.
 
-    2. Kademe — Markdown fence arama:
-       Model açıklama + JSON bloğu ürettiyse fence'i yakala.
-       Örnek: "Tabii, işte analiz:\n```json\n{...}\n```"
-
-    3. Kademe — Greedy { ... } arama (eski davranış, son çare):
-       Model hem metin hem JSON ürettiyse ilk JSON bloğunu bul.
-       Örnek: "Sahne analizi şu şekilde: {...}"
-
-    Tüm kademeler başarısız olursa ValueError fırlatır → infer() fallback'e düşer.
+    Raises:
+        ValueError: Hiçbir kademede geçerli bir JSON sözlüğü bulunamazsa.
     """
     stripped = text.strip()
 
-    # 1. Kademe: direkt parse
+    # 1. Kademe: Direkt parse
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
 
-    # 2. Kademe: markdown fence içinde ara (```json ... ``` veya ``` ... ```)
+    # 2. Kademe: Markdown fence içinde ara
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
     if fence:
         try:
@@ -131,7 +176,7 @@ def _extract_json(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # 3. Kademe: ilk { ... } bloğunu greedy yakala
+    # 3. Kademe: İlk { ... } bloğunu yakala
     brace = re.search(r"\{.*\}", stripped, re.DOTALL)
     if brace:
         try:
@@ -142,26 +187,16 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"VLM çıktısında geçerli JSON bulunamadı: {text[:200]}")
 
 
-def _extract_reasoning_and_json(text: str) -> tuple[str, dict]:
-    """Ham VLM çıktısından reasoning trace ve JSON'ı ayrı ayrı çıkarır.
+def _extract_reasoning_and_json(text: str) -> tuple[str, dict[str, Any]]:
+    """Ham model yanıtından düşünce izini (<think>) ayırır ve kalan metni JSON olarak ayrıştırır.
 
-    [REASONING] Qwen2.5-VL ve benzeri thinking-capable modeller yanıtlarını
-    <think>...</think> bloğuyla başlatır. Bu blok:
-      - Karar Ajanı için ek bağlam sağlar (yüksek confidence + güçlü reasoning)
-      - Debug/audit trail için reasoning_trace alanına kaydedilir
-      - JSON parse'ı etkilememesi için önceden çıkarılır
+    Args:
+        text (str): Modelin ham tamamlanma metni.
 
-    Model reasoning üretmediyse reasoning="" (boş string) döner.
-    Kalan metinden 3 kademeli JSON parse uygulanır (_extract_json).
-
-    Döner: (reasoning_trace_str, parsed_dict)
+    Returns:
+        tuple[str, dict[str, Any]]: (Ayıklanan düşünce metni, ayrıştırılmış JSON sözlüğü).
     """
     reasoning = ""
-    # <think>...</think> veya <düşünme>...</düşünme> bloğunu (non-greedy) ayıkla.
-    # İki etiket desteklenir:
-    #   <think>     → Qwen2.5-VL ve benzeri modellerin standart thinking etiketi
-    #   <düşünme>   → eski Türkçe prompt şablonunun etiketi (geriye dönük uyumluluk)
-    # Her iki etiket de reasoning_trace'e kaydedilir; JSON parse'ı etkilemez.
     think_match = re.search(
         r"<(?:think|düşünme)>(.*?)</(?:think|düşünme)>",
         text,
@@ -169,27 +204,30 @@ def _extract_reasoning_and_json(text: str) -> tuple[str, dict]:
     )
     if think_match:
         reasoning = think_match.group(1).strip()
-        # Bloğu metinden çıkar → kalan metin JSON parse için hazır
         text = text[: think_match.start()] + text[think_match.end() :]
     return reasoning, _extract_json(text.strip())
 
 
-def _compute_confidence(parsed: dict, parse_succeeded: bool) -> float:
-    """VLM çıktısından BAĞIMSIZ güven skoru hesaplar (Değişiklik 1).
+def _compute_confidence(parsed: dict[str, Any], parse_succeeded: bool) -> float:
+    """Modelin öz güveninden bağımsız, kalibre edilmiş çok etmenli güven derecesi hesaplar.
 
-    Model öz güveninden (confidence_overall) FARKLI olarak, bu skor dışsal
-    sinyallere dayanır ve Karar Ajanı'na daha güvenilir bir kalibrasyon sunar:
-      - Parse başarısı   : başarısızsa anında 0.0 döner.
-      - Risk tutarlılığı: yüksek severity + yüksek confidence → skor artar.
-      - Kanıt çeşitliliği: ortalama supporting_frame_count / 8 → max 0.2 bonus.
-      - Model öz güveni : %50 ağırlıkla bileşime girer.
+    Formül Bileşenleri:
+        - Parse Başarısı: JSON bozuksa güven anında 0.0 döner.
+        - Model Öz Güveni: %50 ağırlıkla formüle girer (`confidence_overall * 0.5`).
+        - Risk Tutarlılığı: Tespit edilen risklerin şiddet ve güven ağırlıklı ortalaması (%30 ağırlık).
+        - Kanıt Çeşitliliği: Riskin görüldüğü ortalama kare sayısına bağlı bonus (azami +0.2).
 
-    Ağırlık formülü: model_conf×0.5 + risk_score×0.3 + evidence_bonus (max 0.2)
+    Args:
+        parsed (dict[str, Any]): Ayrıştırılmış model yanıt sözlüğü.
+        parse_succeeded (bool): JSON ayrıştırmanın başarılı olup olmadığı.
+
+    Returns:
+        float: 0.0 ile 1.0 aralığında yuvarlanmış güven katsayısı.
     """
     if not parse_succeeded:
         return 0.0
 
-    model_conf = float(parsed.get("confidence_overall", 0.0))
+    model_conf = float(parsed.get("confidence_overall", 0.0) or 0.0)
 
     raw_risks = [r for r in parsed.get("risk_events", []) if isinstance(r, dict)]
     if raw_risks:
@@ -206,7 +244,7 @@ def _compute_confidence(parsed: dict, parse_succeeded: bool) -> float:
         )
         evidence_bonus = min(avg_frames / 8.0, 1.0) * 0.2
     else:
-        risk_score     = 0.0
+        risk_score = 0.0
         evidence_bonus = 0.0
 
     computed = (model_conf * 0.5) + (risk_score * 0.3) + evidence_bonus
@@ -214,61 +252,54 @@ def _compute_confidence(parsed: dict, parse_succeeded: bool) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Abstract base class — ortak inference arayüzü
+# Soyut Taban Sınıf (VLM Backend Arayüzü)
 # ---------------------------------------------------------------------------
 
 class VLMBackendBase(ABC):
-    """Tüm VLM backend'lerinin uyguladığı soyut arayüz.
+    """Tüm VLM çıkarım motorları için temel arayüz sınıfı.
 
-    TASARIM KARARI: Adapter Pattern
-      Her backend _raw_infer() metodunu uygular (raw metin + token sayısı döner).
-      infer() metodu ortak: latency ölçer, JSON parse eder, S8 paketi oluşturur.
-      Karar Ajanı sadece infer(packet) → VLMInterpretation döngüsünü bilir.
-
-    Yeni bir backend eklemek için:
-      1. Bu sınıftan türet
-      2. backend_name sınıf değişkenini ayarla
-      3. _raw_infer() metodunu uygula
-      4. build_backend() factory'e ekle
+    Tüm backend sınıfları bu sınıftan türer ve :meth:`_raw_infer` metodunu kendi
+    iletişim protokolüne (HTTP REST, C++ bağlamı, Transformers pipeline) göre uygular.
+    Ortak :meth:`infer` şablon metodu gecikme ölçümü, JSON doğrulama ve S8 paketlemesini yönetir.
     """
-    backend_name: str   # "vllm" | "llama.cpp" | "transformers"
-    model_name: str     # kullanılan modelin HF hub adı veya dosya adı
+    backend_name: str
+    model_name: str
 
     @abstractmethod
     def _raw_infer(self, image_path: str, prompt: str) -> tuple[str, int]:
-        """Ham VLM çağrısı — her backend bunu farklı uygular.
-        Döner: (ham_metin, üretilen_token_sayısı)
+        """Görsel ve promptu modele ileten soyut metod.
+
+        Args:
+            image_path (str): Gönderilecek görselin disk yolu.
+            prompt (str): Modele iletilecek sistem ve kullanıcı talimatları.
+
+        Returns:
+            tuple[str, int]: (Model ham metin çıktısı, üretilen token adedi).
         """
 
     def infer(self, packet: VLMFramePacket) -> VLMInterpretation:
-        """S1b paketini alır, VLM'e gönderir, S8 paketi döndürür.
+        """S1b paketini alır, çıkarım yapar ve S8 :class:`contracts.VLMInterpretation` üretir.
 
-        Bu metod tüm backend'lerde ortaktır:
-          1. Grid boyutuna göre dinamik sistem promptu oluştur (build_system_prompt)
-          2. _raw_infer() çağrısını zamanla (latency_ms hesabı için)
-          3. <think>...</think> reasoning trace'i ayıkla, JSON'ı parse et
-          4. Parse başarısız → S8 sözleşmesini bozmadan fallback dict kullan
-          5. RiskEvent listesi oluştur (Değişiklik 5 & 6)
-          6. Bağımsız güven skorunu hesapla (Değişiklik 1)
-          7. VLMInterpretation (S8) oluştur ve döndür (reasoning_trace dahil)
+        Args:
+            packet (VLMFramePacket): Giriş S1b veri paketi.
+
+        Returns:
+            VLMInterpretation: Karar Ajanı için yapılandırılmış S8 yorum paketi.
         """
-        # Adım 1: Grid boyutuna göre dinamik prompt — sabit "0-7" yerine doğru aralık
         system_prompt = build_system_prompt(
             packet.grid_layout.rows, packet.grid_layout.cols
         )
 
         t0 = time.perf_counter()
         raw_text, tokens = self._raw_infer(packet.grid_image_path, system_prompt)
-        latency_ms = (time.perf_counter() - t0) * 1000  # sn -> ms
+        latency_ms = (time.perf_counter() - t0) * 1000
 
         parse_succeeded = True
         reasoning_trace = ""
         try:
-            # [REASONING] <think>...</think> bloğunu ayıkla, kalan metni parse et
             reasoning_trace, parsed = _extract_reasoning_and_json(raw_text)
         except ValueError:
             parse_succeeded = False
-            # Model şemaya uymayan çıktı verdiyse S8 sözleşmesini bozmadan devam et.
             parsed = {
                 "scene_summary_tr": "Model çıktısı ayrıştırılamadı.",
                 "detected_entities": [],
@@ -277,7 +308,6 @@ class VLMBackendBase(ABC):
                 "confidence_overall": 0.0,
             }
 
-        # detected_entities listesini DetectedEntity dataclass'larına dönüştür
         entities = [
             DetectedEntity(
                 label=e.get("label", ""),
@@ -288,7 +318,6 @@ class VLMBackendBase(ABC):
             if isinstance(e, dict)
         ]
 
-        # [DEĞİŞİKLİK 5 & 6] risk_events → RiskEvent listesi
         risk_events = [
             RiskEvent(
                 description_tr=r.get("description_tr", ""),
@@ -301,121 +330,61 @@ class VLMBackendBase(ABC):
             if isinstance(r, dict)
         ]
 
-        # [DEĞİŞİKLİK 1] Bağımsız güven skoru
         computed_conf = _compute_confidence(parsed, parse_succeeded)
 
-        # S8 sözleşme paketi — Karar Ajanı'nın 3. girdisi
         return VLMInterpretation(
-            packet_id=packet.packet_id,       # S1b ile izlenebilirlik bağlantısı
+            packet_id=packet.packet_id,
             video_id=packet.video_id,
             model_name=self.model_name,
-            model_backend=self.backend_name,
+            model_backend=self.backend_name,  # type: ignore[arg-type]
             scene_summary_tr=parsed.get("scene_summary_tr", ""),
             detected_entities=entities,
             detected_actions_tr=parsed.get("detected_actions_tr", []),
             risk_events=risk_events,
-            confidence_overall=float(parsed.get("confidence_overall", 0.0)),
+            confidence_overall=float(parsed.get("confidence_overall", 0.0) or 0.0),
             computed_confidence=computed_conf,
             inference=InferenceMetrics(latency_ms=latency_ms, tokens_generated=tokens),
-            raw_model_output=raw_text,        # debug/audit için ham çıktı
-            reasoning_trace=reasoning_trace,  # [REASONING] <think>...</think> içeriği
+            raw_model_output=raw_text,
+            reasoning_trace=reasoning_trace,
         )
 
 
 # ---------------------------------------------------------------------------
-# Backend 1 — vLLM (GPU hızlı)
+# Backend 1 — vLLM (OpenAI Uyumlu GPU Sunucusu)
 # ---------------------------------------------------------------------------
 
 class VLLMBackend(VLMBackendBase):
-    """vLLM OpenAI-uyumlu sunucu ile inference.
+    """vLLM OpenAI-uyumlu yerel sunucu üzerinden çıkarım yapan arka yüz.
 
-    KULLANIM KOŞULU:
-      vLLM sunucusu görsel destekli bir model ile ayağa kaldırılmış olmalı.
-      Benimki: vllm serve Qwen/Qwen2.5-VL-7B-Instruct --tensor-parallel-size 1
-
-    MESAJ YAPISI (S6 değişikliği):
-      system: SYSTEM_PROMPT (talimatlar)
-      user  : grid görseli (base64 data URI)
-
-         Model system rolünü desteklemiyorsa system bloğunu kaldır,
-         prompt'u user content'inin başına {"type":"text","text":prompt} olarak ekle.
+    Attributes:
+        base_url (str): Sunucu kök URL'i (örn. 'http://localhost:8000').
+        model_name (str): Sunucuda barındırılan model adı (örn. 'Qwen/Qwen2.5-VL-7B-Instruct').
+        max_tokens (int): Üretilecek azami token bütçesi.
+        temperature (float): Örnekleme sıcaklığı.
+        timeout_sec (int): HTTP istek zaman aşımı (sn).
     """
     backend_name = "vllm"
 
-    def __init__(self, base_url: str, model_name: str,
-                 max_tokens: int = 512, temperature: float = 0.2,
-                 timeout_sec: int = 60):
-        # S5: temperature artık __init__ parametresi → config.yaml'dan gelir
+    def __init__(
+        self,
+        base_url: str,
+        model_name: str,
+        max_tokens: int = 512,
+        temperature: float = 0.2,
+        timeout_sec: int = 60,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         self.max_tokens = max_tokens
-        self.temperature = temperature  # config.yaml'da vllm.temperature: 0.15
-        self.timeout_sec = timeout_sec  # [#5] HTTP timeout → config.yaml'dan
+        self.temperature = temperature
+        self.timeout_sec = timeout_sec
 
     def _raw_infer(self, image_path: str, prompt: str) -> tuple[str, int]:
         b64 = _encode_jpeg_b64(image_path)
         payload = {
             "model": self.model_name,
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature,  # S5: hardcode 0.2
-            # S6: SYSTEM_PROMPT ayrı "system" rolünde → user sadece görsel içerir
-            "messages": [
-                {
-                    "role": "system",
-                    "content": prompt,        # SYSTEM_PROMPT burada
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    ],
-                },
-            ],
-        }
-        resp = requests.post(f"{self.base_url}/v1/chat/completions", json=payload, timeout=self.timeout_sec)
-        resp.raise_for_status()  # HTTP hatalarını yukarı taşı
-        data = resp.json()
-        text   = data["choices"][0]["message"]["content"]
-        tokens = data.get("usage", {}).get("completion_tokens", 0)
-        return text, tokens
-
-
-# ---------------------------------------------------------------------------
-# Backend 2 — llama.cpp (GGUF model, CPU veya küçük GPU için)
-# ---------------------------------------------------------------------------
-
-class LlamaCppBackend(VLMBackendBase):
-    """llama.cpp'nin llama-server'ı ile inference.
-
-    KULLANIM KOŞULU:
-      llama-server multimodal GGUF model + mmproj dosyasıyla çalışıyor olmalı.
-      Örnek: llama-server -m model.gguf --mmproj mmproj.gguf -c 16384
-
-    ! LLaVA tabanlı bazı GGUF modeller system rolünü desteklemez.
-       Desteklemiyorsa bu sınıftaki messages'tan system bloğunu kaldır ve
-       prompt'u user content'e text olarak ekle:
-       {"type": "text", "text": prompt}
-    """
-    backend_name = "llama.cpp"
-
-    def __init__(self, base_url: str, model_name: str,
-                 max_tokens: int = 512, temperature: float = 0.2,
-                 timeout_sec: int = 60):
-        # S5: temperature artık __init__ parametresi → config.yaml'dan gelir
-        self.base_url = base_url.rstrip("/")
-        self.model_name = model_name
-        self.max_tokens = max_tokens
-        self.temperature = temperature  # config.yaml'da llama_cpp.temperature: 0.15
-        self.timeout_sec = timeout_sec  # [#5] HTTP timeout → config.yaml'dan
-
-    def _raw_infer(self, image_path: str, prompt: str) -> tuple[str, int]:
-        b64 = _encode_jpeg_b64(image_path)
-        payload = {
-            "model":self.model_name,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,  # S5: hardcode 0.2 → self.temperature
-            # S6: SYSTEM_PROMPT ayrı "system" rolünde
+            "temperature": self.temperature,
             "messages": [
                 {
                     "role": "system",
@@ -424,57 +393,122 @@ class LlamaCppBackend(VLMBackendBase):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        },
                     ],
                 },
             ],
         }
-        resp = requests.post(f"{self.base_url}/v1/chat/completions", json=payload, timeout=self.timeout_sec)
+        resp = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            timeout=self.timeout_sec,
+        )
         resp.raise_for_status()
-        data   = resp.json()
-        text   = data["choices"][0]["message"]["content"]
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"]
         tokens = data.get("usage", {}).get("completion_tokens", 0)
         return text, tokens
 
 
 # ---------------------------------------------------------------------------
-# Backend 3 — HuggingFace Transformers (sunucusuz, geliştirme/test için)
+# Backend 2 — llama.cpp (GGUF Multimodal Sunucu)
+# ---------------------------------------------------------------------------
+
+class LlamaCppBackend(VLMBackendBase):
+    """llama-server GGUF multimodal çıkarım motoru adaptörü.
+
+    Attributes:
+        base_url (str): Sunucu kök adresi.
+        model_name (str): Model adı.
+        max_tokens (int): Azami token bütçesi.
+        temperature (float): Sıcaklık değeri.
+        timeout_sec (int): HTTP zaman aşımı.
+    """
+    backend_name = "llama.cpp"
+
+    def __init__(
+        self,
+        base_url: str,
+        model_name: str,
+        max_tokens: int = 512,
+        temperature: float = 0.2,
+        timeout_sec: int = 60,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model_name = model_name
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.timeout_sec = timeout_sec
+
+    def _raw_infer(self, image_path: str, prompt: str) -> tuple[str, int]:
+        b64 = _encode_jpeg_b64(image_path)
+        payload = {
+            "model": self.model_name,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": prompt,
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        },
+                    ],
+                },
+            ],
+        }
+        resp = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            timeout=self.timeout_sec,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"]
+        tokens = data.get("usage", {}).get("completion_tokens", 0)
+        return text, tokens
+
+
+# ---------------------------------------------------------------------------
+# Backend 3 — HuggingFace Transformers (Süreç İçi Model Yükleme)
 # ---------------------------------------------------------------------------
 
 class TransformersBackend(VLMBackendBase):
-    """HuggingFace transformers ile doğrudan model yüklemesi.
+    """HuggingFace transformers kütüphanesi üzerinden GPU/CPU üzerinde doğrudan model yürütücüsü.
 
-    KULLANIM KOŞULU:
-      GPU varsa device="cuda", yoksa device="cpu" kullan (yavaş).
-      Üretimde vLLM veya llama.cpp önerilir (daha hızlı, daha az bellek).
-
-    LAZY LOADING:
-      Model ilk _raw_infer() çağrısında yüklenir (ağır modeli hemen yükleme).
-      Bu sayede backend nesnesi oluşturulduğunda bellek kullanılmaz.
+    Lazy loading tasarımıyla model ağırlıkları ilk çıkarım isteğinde belleğe yüklenir.
     """
     backend_name = "transformers"
 
-    def __init__(self, model_name: str, device: str = "cuda", max_new_tokens: int = 512):
-        self.model_name      = model_name
-        self.max_new_tokens  = max_new_tokens
-        self._model          = None       # lazy load: ilk çağrıda yüklenir
-        self._processor      = None       # lazy load: ilk çağrıda yüklenir
-        self._device         = device
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "cuda",
+        max_new_tokens: int = 512,
+    ) -> None:
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self._model = None
+        self._processor = None
+        self._device = device
 
-    def _lazy_load(self):
-        """Modeli ilk çağrıda yükle (lazy initialization pattern).
-
-        Neden lazy?
-          TransformersBackend nesnesi oluşturulduğunda model yüklenmez.
-          İlk infer() çağrısında yüklenir → başlangıç süresi optimize edilir.
-        """
+    def _lazy_load(self) -> None:
+        """Model ağırlıklarını ve işlemcisini talep anında (lazy) belleğe yükler."""
         if self._model is not None:
-            return  # zaten yüklü, tekrar yükleme
-        from transformers import AutoProcessor, AutoModelForImageTextToText
+            return
         import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
         self._processor = AutoProcessor.from_pretrained(self.model_name)
-        self._model     = AutoModelForImageTextToText.from_pretrained(
+        self._model = AutoModelForImageTextToText.from_pretrained(
             self.model_name, torch_dtype=torch.bfloat16, device_map=self._device
         )
 
@@ -483,44 +517,39 @@ class TransformersBackend(VLMBackendBase):
         from PIL import Image
 
         image = Image.open(image_path).convert("RGB")
-
-        # Transformers API: görsel ve metin birlikte user mesajına girer
-        # (system rol desteği modele göre değişir, burada user'a ekliyoruz)
         messages = [{
             "role": "user",
             "content": [{"type": "image"}, {"type": "text", "text": prompt}],
         }]
         chat_prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
-        inputs      = self._processor(text=chat_prompt, images=image, return_tensors="pt").to(self._device)
-        output      = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+        inputs = self._processor(text=chat_prompt, images=image, return_tensors="pt").to(self._device)
+        output = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens)
 
-        # Sadece yeni üretilen token'ları decode et (giriş token'larını çıkar)
-        text             = self._processor.decode(output[0], skip_special_tokens=True)
+        text = self._processor.decode(output[0], skip_special_tokens=True)
         tokens_generated = output.shape[-1] - inputs["input_ids"].shape[-1]
         return text, int(tokens_generated)
 
 
 # ---------------------------------------------------------------------------
-# Factory fonksiyonu — pipeline.py bu fonksiyonu çağırır
+# Backend Fabrika Fonksiyonu
 # ---------------------------------------------------------------------------
 
-def build_backend(config: dict) -> VLMBackendBase:
-    """Config dict'inden uygun backend nesnesini oluşturur.
+def build_backend(config: dict[str, Any]) -> VLMBackendBase:
+    """Yapılandırma sözlüğüne göre ilgili VLM backend nesnesini oluşturur.
 
-    config dict'i pipeline.py'nin _load_vlm_config() fonksiyonundan gelir,
-    o da config.yaml'daki [vlm:] bloğundan okunur.
+    Args:
+        config (dict[str, Any]): `config.yaml` dosyasından okunan veya varsayılan ayarlara
+            sahip konfigürasyon sözlüğü.
 
-    config['backend'] beklenen değerler: 'vllm' | 'llama.cpp' | 'transformers'
+    Returns:
+        VLMBackendBase: Yapılandırılmış arka yüz nesnesi.
 
-    S5 değişikliği:
-      temperature artık config.get("temperature", 0.15) ile geçiriliyor.
-      config.yaml'da vllm.temperature: 0.15 ve llama_cpp.temperature: 0.15 tanımlı.
+    Raises:
+        ValueError: Bilinmeyen bir backend adı belirtildiğinde.
     """
     backend = config["backend"]
 
     if backend == "server":
-        # TEKNOFEST EVREN (veya herhangi bir OpenAI-uyumlu servis).
-        # Anahtar yapılandırmaya yazılmaz; ortam değişkeninden okunur.
         api_key = os.environ.get(config.get("api_key_env", "EVREN_API_KEY"), "").strip()
         if not api_key:
             print(
@@ -539,18 +568,20 @@ def build_backend(config: dict) -> VLMBackendBase:
         )
 
     if backend == "vllm":
-        # S5: temperature config'den geçiyor (config.yaml: vllm.temperature: 0.15)
-        # [#5]: timeout_sec config'den geçiyor (config.yaml: vllm.timeout_sec: 120)
         return VLLMBackend(
-            config["base_url"], config["model_name"],
-            config.get("max_tokens", 512), config.get("temperature", 0.15),
+            config["base_url"],
+            config["model_name"],
+            config.get("max_tokens", 512),
+            config.get("temperature", 0.15),
             config.get("timeout_sec", 60),
         )
 
     if backend == "llama.cpp":
         return LlamaCppBackend(
-            config["base_url"], config["model_name"],
-            config.get("max_tokens", 512), config.get("temperature", 0.15),
+            config["base_url"],
+            config["model_name"],
+            config.get("max_tokens", 512),
+            config.get("temperature", 0.15),
             config.get("timeout_sec", 60),
         )
 
@@ -568,12 +599,11 @@ def build_backend(config: dict) -> VLMBackendBase:
 
 
 # ===========================================================================
-# EVREN SERVER BACKEND — video destekli, OpenAI-uyumlu harici çıkarım servisi
+# TEKNOFEST EVREN SERVER BACKEND — Video ve Görsel Destekli REST Servis
 # ===========================================================================
 
-# EVREN gövde sınırı 256 MB; base64 kodlaması boyutu ~1/3 artırdığı için ham
-# dosya sınırı pratikte ~190 MB'a karşılık gelir.
-_RAW_VIDEO_LIMIT_BYTES = int(256 * 1024 * 1024 / 1.34)
+#: EVREN REST API 256 MB gövde sınırına göre Base64 öncesi azami ham dosya boyutu (~190 MB)
+_RAW_VIDEO_LIMIT_BYTES: int = int(256 * 1024 * 1024 / 1.34)
 
 
 def build_video_system_prompt(
@@ -582,30 +612,25 @@ def build_video_system_prompt(
     memory_context: str = "",
     is_segment: bool = False,
 ) -> str:
-    """Video modu için S8 şemasını isteyen prompt'u üretir.
+    """Video modu için mutlak zaman ekseni ve hafıza bağlamı içeren sistem promptunu oluşturur.
 
-    Üç şeyi açıkça bildirmek zorundayız:
-
-    1. **Mutlak zaman ekseni.** Klip uzun bir kaydın parçası olabilir. Model
-       klibin kendi ``0:00``ını videonun başı sanırsa tüm zaman damgaları
-       kayar. Ölçümde model 10 saniyelik bir klipte ``00:00:55:08`` gibi
-       tutarsız damgalar üretebildiği için zaman, saniye cinsinden **sayı**
-       olarak istenir (metin biçim yerine) ve aralık açıkça verilir.
-    2. **Önceki segmentlerin bağlamı.** Metin hafıza (bkz.
-       :class:`contracts.VideoAnalysisMemory`) prompt'a eklenir; böylece süregelen
-       durumlar tekrar "yeni olay" sayılmaz.
-    3. **Genel terim kullanımı.** Spesifik sınıf adları (forklift, palet)
-       bilinçli olarak istenmez; onları algı katmanı (YOLO) sağlar. Kanal B'nin
-       değeri bağımsız ve önyargısız görsel yorum olmasıdır.
+    Önemli Kurallar:
+        - **Mutlak Zaman Ekseni:** Klibin göreli 0:00 anı yerine videonun gerçek başlangıç
+          saniyesi (`clip_start_sec`) modele bildirilir. Risk olaylarının `timestamp_sec`
+          alanı bu mutlak saniye aralığında talep edilir.
+        - **Metin Hafıza Bağlamı:** Önceki segmentlerden aktarılan varlık ve olaylar
+          özetlenerek modele verilir.
+        - **Genel Varlık Terminolojisi:** Modelden nesne tespitini genel etiketlerle
+          ('person', 'vehicle', 'machine') yapması istenir.
 
     Args:
-        clip_start_sec: Klibin tam videodaki mutlak başlangıcı.
-        clip_end_sec: Klibin tam videodaki mutlak bitişi.
-        memory_context: Önceki segmentlerden taşınan metin hafıza (boş olabilir).
-        is_segment: Klip, daha uzun bir videonun parçası mı.
+        clip_start_sec (float): Klibin tam videodaki mutlak başlangıç saniyesi.
+        clip_end_sec (float): Klibin tam videodaki mutlak bitiş saniyesi.
+        memory_context (str, optional): Önceki segmentlerden taşınan metin hafızası.
+        is_segment (bool, optional): Klibin daha uzun bir videonun segmenti olup olmadığı.
 
     Returns:
-        Modele gönderilecek tam prompt metni.
+        str: Modele gönderilecek İngilizce/Türkçe sistem promptu metni.
     """
     start_label = format_mmss(clip_start_sec)
     end_label = format_mmss(clip_end_sec)
@@ -666,22 +691,11 @@ def build_video_system_prompt(
 
 
 class ServerBackend(VLMBackendBase):
-    """OpenAI-uyumlu harici çıkarım servisi (TEKNOFEST EVREN) — video + grid.
+    """TEKNOFEST EVREN ve OpenAI-uyumlu harici VLM servisleri adaptörü.
 
-    Bu backend iki modu da destekler:
-
-    * :meth:`infer` (tabandan gelir) — grid JPEG'i görüntü olarak gönderir.
-      EVREN'de görüntü kabul eden modeller ``llm-fast``/``llm-large``dır.
-    * :meth:`infer_video` — videoyu doğrudan gönderir. EVREN'de video
-      analizine özelleşmiş alias ``vlm``dir ve **görüntü kabul etmez**; bu
-      yüzden iki mod için iki ayrı model adı tutulur.
-
-    Ön ek önbelleği (prefix cache): video baytları birebir aynı kaldığı sürece
-    aynı klip üzerinden sorulan takip soruları önbellekten yararlanır. Bu
-    nedenle base64 kodlaması :meth:`encode_video` ile bir kez yapılıp
-    :meth:`infer_video`'ya ``video_b64`` olarak geçirilebilir.
+    Hem grid JPEG görsellerini (`model_name`) hem de doğrudan MP4 videoları
+    (`video_model`, varsayılan 'vlm') destekler.
     """
-
     backend_name = "server"
 
     def __init__(
@@ -694,29 +708,50 @@ class ServerBackend(VLMBackendBase):
         temperature: float = 0.15,
         timeout_sec: int = 1800,
         enable_thinking: bool | None = False,
-    ):
+    ) -> None:
+        """ServerBackend nesnesini başlatır.
+
+        Args:
+            base_url (str): API uç nokta kökü.
+            model_name (str): Görsel ve metin modeli (örn. 'llm-large').
+            video_model (str | None, optional): Video analizi modeli (örn. 'vlm').
+            api_key (str | None, optional): Bearer yetkilendirme anahtarı.
+            max_tokens (int, optional): Azami üretim token limiti. Varsayılan: 65536.
+            temperature (float, optional): Sıcaklık değeri. Varsayılan: 0.15.
+            timeout_sec (int, optional): İstek zaman aşımı (saniye). Varsayılan: 1800.
+            enable_thinking (bool | None, optional): Akıl yürütme düşünce izi bayrağı.
+        """
         self.base_url = base_url.rstrip("/")
-        self.model_name = model_name          # görüntü/metin modeli
+        self.model_name = model_name
         self.video_model = video_model or model_name
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout_sec = timeout_sec
-        # Akıl yürütme kapalı: açıkken üretim token'ı dalgalanıp bütçeyi taşırıyor
-        # ve ayrıştırıcı izi sildiği için yanıt HTTP 200 ile boş dönebiliyor.
         self.enable_thinking = enable_thinking
 
-    # -- HTTP ------------------------------------------------------------
-
-    def _headers(self) -> dict:
+    def _headers(self) -> dict[str, str]:
+        """HTTP istek başlıklarını oluşturur."""
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _post(self, model: str, content: list, max_tokens: int | None = None) -> tuple[str, int]:
-        """``/chat/completions`` çağrısı yapar; (metin, token) döner."""
-        payload = {
+    def _post(self, model: str, content: list[dict[str, Any]], max_tokens: int | None = None) -> tuple[str, int]:
+        """`/chat/completions` uç noktasına HTTP POST isteği gönderir.
+
+        Args:
+            model (str): Çağrılacak model adı.
+            content (list[dict[str, Any]]): Mesaj içerik blokları.
+            max_tokens (int | None, optional): İstek özelinde token limiti.
+
+        Returns:
+            tuple[str, int]: (Model yanıt metni, üretilen token adedi).
+
+        Raises:
+            RuntimeError: Sunucu 200 harici HTTP yanıtı dönerse veya içerik boşsa.
+        """
+        payload: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": content}],
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
@@ -727,7 +762,9 @@ class ServerBackend(VLMBackendBase):
 
         resp = requests.post(
             f"{self.base_url}/chat/completions",
-            headers=self._headers(), json=payload, timeout=self.timeout_sec,
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout_sec,
         )
         if resp.status_code != 200:
             raise RuntimeError(
@@ -746,10 +783,8 @@ class ServerBackend(VLMBackendBase):
             )
         return text, tokens
 
-    # -- Grid modu (taban sınıfın infer() akışı bunu çağırır) -------------
-
     def _raw_infer(self, image_path: str, prompt: str) -> tuple[str, int]:
-        """Grid JPEG'ini görüntü olarak gönderir (görüntü destekli modelle)."""
+        """Grid JPEG görselini `model_name` modeline gönderir."""
         b64 = _encode_jpeg_b64(image_path)
         content = [
             {"type": "text", "text": prompt},
@@ -757,20 +792,19 @@ class ServerBackend(VLMBackendBase):
         ]
         return self._post(self.model_name, content)
 
-    # -- Video modu ------------------------------------------------------
-
     @staticmethod
     def encode_video(video_path: str) -> str:
-        """Videoyu base64'e çevirir ve gövde sınırını denetler.
+        """Video dosyasını Base64 dizesine dönüştürür ve gövde boyutunu denetler.
 
-        Aynı klip üzerinden birden fazla soru sorulacaksa bu metot bir kez
-        çağrılıp sonuç tekrar kullanılmalıdır; yeniden kodlama baytları
-        değiştirmese de gereksiz iştir, farklı baytlar ise ön ek önbelleğini
-        kaçırır.
+        Args:
+            video_path (str): Video dosya yolu.
+
+        Returns:
+            str: Base64 kodlanmış video verisi.
 
         Raises:
-            FileNotFoundError: Dosya yoksa.
-            RuntimeError: Ham dosya gövde sınırını aşarsa.
+            FileNotFoundError: Dosya mevcut değilse.
+            RuntimeError: Boyut API sınırını aşıyorsa.
         """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video bulunamadı: {video_path}")
@@ -793,20 +827,20 @@ class ServerBackend(VLMBackendBase):
         video_b64: str | None = None,
         packet_id: str | None = None,
     ) -> VLMInterpretation:
-        """Videoyu doğrudan modele gönderip S8 yorumunu üretir.
+        """Video dosyasını doğrudan `video_model` (vlm) modeline göndererek S8 yorumunu üretir.
 
         Args:
-            video_path: Gönderilecek mp4.
-            video_id: İzlenebilirlik kimliği.
-            clip_start_sec: Klibin tam videodaki mutlak başlangıcı.
-            clip_end_sec: Klibin tam videodaki mutlak bitişi.
-            memory_context: Önceki segmentlerin metin hafızası.
-            is_segment: Klip daha uzun bir videonun parçası mı.
-            video_b64: Önceden kodlanmış base64 içerik (ön ek önbelleği için).
-            packet_id: S1b bağlantısı yoksa üretilecek kimlik.
+            video_path (str): Analiz edilecek MP4 klibi.
+            video_id (str): Video kimliği.
+            clip_start_sec (float, optional): Klibin tam videodaki mutlak başlangıç saniyesi.
+            clip_end_sec (float, optional): Klibin tam videodaki mutlak bitiş saniyesi.
+            memory_context (str, optional): Önceki segmentlerin metin hafızası.
+            is_segment (bool, optional): Parçalı video segmenti mi bayrağı.
+            video_b64 (str | None, optional): Önceden kodlanmış Base64 verisi (prefix caching için).
+            packet_id (str | None, optional): Özel paket UUID'si.
 
         Returns:
-            :class:`contracts.VLMInterpretation` — S8 paketi.
+            VLMInterpretation: S8 sözleşmesi nesnesi.
         """
         import uuid
 
@@ -884,24 +918,21 @@ class ServerBackend(VLMBackendBase):
         self,
         question: str,
         video_b64: str,
-        history: list | None = None,
+        history: list[dict[str, Any]] | None = None,
         max_tokens: int = 1024,
     ) -> str:
-        """Aynı video üzerinden takip sorusu sorar (ön ek önbelleği isabet eder).
-
-        Video baytları değişmediği için bu çağrı soğuk çağrıya göre belirgin
-        şekilde hızlıdır. ``history`` verilirse konuşma büyütülerek gönderilir.
+        """Aynı video üzerinde takip sorusu sorar (ön ek önbelleği / prefix cache isabeti).
 
         Args:
-            question: Sorulacak soru.
-            video_b64: :meth:`encode_video` ile bir kez üretilmiş içerik.
-            history: Önceki ``{"role", "content"}`` mesajları.
-            max_tokens: Bu çağrı için token bütçesi.
+            question (str): Sorulacak soru metni.
+            video_b64 (str): Base64 formatındaki video içeriği.
+            history (list[dict[str, Any]] | None, optional): Geçmiş konuşma mesajları.
+            max_tokens (int, optional): Yanıt için ayrılan token limiti. Varsayılan: 1024.
 
         Returns:
-            Modelin metin yanıtı.
+            str: Modelin ürettiği metin cevabı.
         """
-        messages = list(history) if history else [{
+        messages: list[dict[str, Any]] = list(history) if history else [{
             "role": "user",
             "content": [
                 {"type": "text", "text": "Bu videoyu inceleyeceğiz."},
@@ -910,7 +941,7 @@ class ServerBackend(VLMBackendBase):
         }]
         messages.append({"role": "user", "content": question})
 
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.video_model,
             "messages": messages,
             "max_tokens": max_tokens,
@@ -921,51 +952,52 @@ class ServerBackend(VLMBackendBase):
 
         resp = requests.post(
             f"{self.base_url}/chat/completions",
-            headers=self._headers(), json=payload, timeout=self.timeout_sec,
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout_sec,
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"].get("content") or ""
 
 
+# ---------------------------------------------------------------------------
+# Zaman Damgası Normalizasyonu Fonksiyonu
+# ---------------------------------------------------------------------------
+
 def _clamp_timestamp(
     value: object, start_sec: float, end_sec: float
 ) -> float | None:
-    """Modelin verdiği zaman damgasını klip aralığına oturtur.
+    """Modelin ürettiği zaman damgasını klip aralığına oturtur ve mutlak zamana dönüştürür.
 
-    Ölçümde model, 10 saniyelik bir klipte ``00:00:55:08`` gibi aralık dışı
-    damgalar üretebiliyor. Böyle bir değeri olduğu gibi kabul etmek, olayları
-    videonun yanlış anına yerleştirir. Bu yüzden:
-
-    * Sayıya çevrilemeyen değer ``None`` olur (zaman bilinmiyor sayılır).
-    * Değer zaten klibin mutlak aralığındaysa olduğu gibi korunur.
-    * Mutlak aralığın dışında, ancak klip süresi içindeyse göreli kabul edilip
-      mutlak eksene taşınır.
-    * Diğer aralık dışı değerler en yakın sınıra çekilir.
+    Model bazen segment süresi içinde göreli zaman (örn. 0.0-10.0 sn) veya geçersiz
+    değerler üretebilir. Bu fonksiyon:
+        - Sayısal olmayan veya None değerleri None yapar.
+        - Değer zaten mutlak segment aralığındaysa doğrudan korur.
+        - Değer göreli klip süresine uyuyorsa `start_sec + ts` ile mutlak eksene öteler.
+        - Aralık dışı sapan değerleri en yakın sınır saniyesine (start_sec / end_sec) çeker.
 
     Args:
-        value: Modelin ``timestamp_sec`` alanı.
-        start_sec: Klibin mutlak başlangıcı.
-        end_sec: Klibin mutlak bitişi.
+        value (object): Modelin ürettiği `timestamp_sec` verisi.
+        start_sec (float): Segmentin mutlak başlangıç saniyesi.
+        end_sec (float): Segmentin mutlak bitiş saniyesi.
 
     Returns:
-        Aralığa oturtulmuş mutlak saniye veya ``None``.
+        float | None: Mutlak saniye değeri veya None.
     """
     if value is None:
         return None
     try:
-        ts = float(value)
+        ts = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
 
     duration = max(0.0, end_sec - start_sec)
 
-    # Prompt ve S8 sözleşmesi mutlak tam-video saniyesi ister. Değer zaten
-    # segmentin mutlak aralığındaysa göreli sanıp ikinci kez ofsetleme.
+    # Değer zaten mutlak segment aralığındaysa koru
     if end_sec > start_sec and start_sec <= ts <= end_sec:
         return ts
 
-    # Mutlak aralığa girmeyen fakat klip süresine uyan değer, modelin prompta
-    # rağmen klibe göreli yanıt vermiş olabileceği durumlar için fallback'tir.
+    # Göreli zaman damgası tespiti ve mutlak zamana öteleme
     if start_sec > 0 and 0.0 <= ts <= duration + 1e-6:
         ts = start_sec + ts
 

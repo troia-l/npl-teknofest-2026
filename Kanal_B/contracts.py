@@ -1,191 +1,285 @@
 """
-plan/13 sözleşmeleri: S1b (vlm_frame_packet) ve S8 (vlm_interpretation)
+Kanal B - Veri Sözleşmeleri ve Şemalar Modülü (contracts.py)
+============================================================
 
-NOT: Bu şemalar diagramdan ve görev tanımından türetildi (plan/13 dosyanın
-içeriğini görmedim). Eğer gerçek sözleşmede alan adları/isimlendirme farklıysa,
-sadece bu dosyadaki dataclass alanlarını güncellemen yeterli — üretim mantığı
-(preprocessing.py, vlm_backend.py) şemadan ayrıştırılmış durumda, sadece
-to_dict() çıktısını eşlemen gerekir.
+Bu modül, Kanal B mimarisindeki veri alışverişi sözleşmelerini (data contracts),
+ara katman yapılarını ve segmentler arası bağlamsal hafıza nesnelerini tanımlar.
+
+Sözleşme Standartları:
+----------------------
+1. **S1b Sözleşmesi (:class:`VLMFramePacket`):**
+   - Kanal B ön işleme katmanının (:mod:`preprocessing`) çıktısı, VLM çıkarım
+     arka yüzünün (:mod:`vlm_backend`) girdisidir.
+   - Seçilen video karelerinin kalite metriklerini, grid yerleşimini ve diskteki
+     görsel yolunu taşır.
+
+2. **S8 Sözleşmesi (:class:`VLMInterpretation`):**
+   - VLM arka yüzünün ürettiği ve Karar Ajanı'na (:mod:`src.reasoning.decision_agent`)
+     iletilen nihai görsel yorum paketidir.
+   - Sahne özeti, tespit edilen genel varlıklar, gözlemlenen eylemler, derecelendirilmiş
+     İSG risk olayları (:class:`RiskEvent`) ve performans metriklerini içerir.
+
+3. **Segmentli / İterasyonlu Sözleşmeler:**
+   - :class:`SegmentResult` ve :class:`BatchResult`: Uzun videoların parçalı analiz
+     sonuçlarını tek bir potada toplar veya geriye dönük uyumlu tekil S8 yorumuna
+     indirger (:meth:`BatchResult.to_interpretation_dict`).
+   - :class:`VideoAnalysisMemory`: Segmentler arası bağlamı (varlıklar, kronolojik riskler)
+     metin formatında damıtarak bağlam penceresi taşmasını önleyen dinamik hafıza yapısıdır.
 """
+
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
+
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
-import uuid
 
 
 def _now_iso() -> str:
-    """UTC ISO-8601 zaman damgası üretir — tüm paketler için oluşturulma zamanı."""
+    """UTC zaman diliminde ISO-8601 standart zaman damgası üretir.
+
+    Returns:
+        str: 'YYYY-MM-DDTHH:MM:SS.mmmmmm+00:00' formatında zaman dizesi.
+    """
     return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
-# S1b — Kanal B ön işleme çıktısı (preprocessing.py → backend.py)
+# S1b — Kanal B Ön İşleme Çıktısı (preprocessing.py → vlm_backend.py)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class FrameQualityMetrics:
-    """Bir kare için hesaplanan kalite/sahne metrikleri.
-    Bu metrikler hem kare seçim kararını hem de S1b paketinin içeriğini belirler."""
-    laplacian_var: float          # keskinlik / bulanıklık tespiti — yüksek = keskin
-    ssim_diff: float               # bir önceki seçilen kareyle sahne farkı (0-1)
-    brightness_mean: float         # 0-255, düşük ışık kararı için (CLAHE eşiği)
+    """Bir kareye ilişkin hesaplanan kalite, keskinlik ve parlaklık metrikleri.
+
+    Bu metrikler hem akıllı kare seçim algoritmasında hem de S1b paketinin denetim
+    izinde (audit trail) kullanılır.
+
+    Attributes:
+        laplacian_var (float): Laplacian varyansı ile ölçülen keskinlik derecesi.
+            Yüksek değerler keskin/net kenarlara, düşük değerler odak/hareket bulanıklığına
+            işaret eder.
+        ssim_diff (float): Bir önceki seçilmiş/aday kareyle aradaki Yapısal Benzerlik
+            (SSIM) farkı (1.0 - SSIM, [0.0 - 1.0] aralığında). Yüksek değer sahne değişimini gösterir.
+        brightness_mean (float): Karenin ortalama piksel parlaklığı (0.0=tam siyah, 255.0=tam beyaz).
+            CLAHE kontrast iyileştirmesi kararı için eşik değerle kıyaslanır.
+    """
+    laplacian_var: float
+    ssim_diff: float
+    brightness_mean: float
 
 
 @dataclass
 class FrameMeta:
-    """Seçilen her kare için kimlik + seçilme gerekçesi + kalite bilgisi.
-    selection_reason → Karar Ajanı'nın hangi kareye neden bakması gerektiğini anlar."""
-    frame_index: int               # orijinal videodaki karenin sıra numarası
-    timestamp_sec: float           # videonun başından itibaren saniye cinsinden konum
-    grid_position: int             # grid içindeki sırası (0'dan başlar, soldan sağa)
+    """Seçilen her bir karenin kimlik, zamanlama, yerleşim ve seçim gerekçesi bilgisi.
+
+    Attributes:
+        frame_index (int): Orijinal videodaki 0-tabanlı kare numarası.
+        timestamp_sec (float): Karenin videonun başlangıcına göre saniye cinsinden mutlak konumu.
+        grid_position (int): Kare grid görseline yerleştirildiğindeki hücre sırası (0-indeksli).
+        selection_reason (Literal): Karenin neden seçildiğini belirten gerekçe etiketi:
+            - "scene_change": SSIM farkı yüksek, belirgin sahne veya açı değişimi.
+            - "motion_peak": Optik akış veya hareket tepe noktası.
+            - "uniform_sample": Düşük sahne değişimi durumunda periyodik/eşit aralıklı örnekleme.
+            - "fallback_fill": Yetersiz aday durumunda zaman ekseninde zorunlu doldurma.
+        quality (FrameQualityMetrics): Kareye ait kalite ve parlaklık metrikleri nesnesi.
+    """
+    frame_index: int
+    timestamp_sec: float
+    grid_position: int
     selection_reason: Literal[
-        "scene_change",            # SSIM farkı yüksek → sahne değişimi
-        "motion_peak",             # optik akış zirvesi (ileride eklenecek)
-        "uniform_sample",          # SSIM farkı düşük → eşit aralıklı örnekleme
-        "fallback_fill",           # yetersiz aday → zaman ekseninde eşit aralıklı doldurma
+        "scene_change",
+        "motion_peak",
+        "uniform_sample",
+        "fallback_fill",
     ]
     quality: FrameQualityMetrics
 
 
 @dataclass
 class GridLayout:
-    """Grid görseli boyut bilgisi — VLM hangi boyutta görüntü aldığını bilsin."""
-    rows: int                      # satır sayısı (genellikle 2)
-    cols: int                      # sütun sayısı (genellikle 4)
-    cell_size: tuple[int, int]     # tek hücre (w, h) piksel — config.yaml'dan gelir
+    """Oluşturulan grid (mozaik) görselinin geometrik boyut ve ızgara bilgileri.
+
+    VLM modelinin hangi matris düzeninde görüntü aldığını bilmesini sağlar.
+
+    Attributes:
+        rows (int): Grid görselindeki satır sayısı (örn. 2).
+        cols (int): Grid görselindeki sütun sayısı (örn. 4).
+        cell_size (tuple[int, int]): Her bir hücrenin (genişlik, yükseklik) piksel boyutları.
+    """
+    rows: int
+    cols: int
+    cell_size: tuple[int, int]
 
 
 @dataclass
 class EnhancementInfo:
-    """CLAHE uygulaması meta verisi — Karar Ajanı düşük ışık düzeltmesi yapıldığını bilsin."""
-    clahe_applied: bool            # en az bir kare karanlıksa True
-    clip_limit: float              # CLAHE kontrast sınır katsayısı
-    tile_grid_size: tuple[int, int]  # CLAHE mozaik ızgara boyutu
+    """Görüntü iyileştirme (CLAHE - Kontrast Sınırlı Adaptif Histogram Eşitleme) meta verisi.
+
+    Karar mekanizmasının düşük ışık koşullarında yapay aydınlatma uygulandığını bilmesini sağlar.
+
+    Attributes:
+        clahe_applied (bool): Paketteki en az bir kareye CLAHE uygulandıysa True, aksi halde False.
+        clip_limit (float): CLAHE algoritmasında uygulanan kontrast sınır katsayısı.
+        tile_grid_size (tuple[int, int]): CLAHE algoritmasının mozaik ızgara boyutu (örn. (8, 8)).
+    """
+    clahe_applied: bool
+    clip_limit: float
+    tile_grid_size: tuple[int, int]
 
 
 @dataclass
 class VLMFramePacket:
-    """S1b sözleşmesi — Kanal B ön işleme çıktısı, VLM backend'in GİRDİSİ.
+    """S1b Sözleşmesi — Kanal B Ön İşleme Çıktısı ve VLM Arka Yüzünün Girdisi.
 
-    preprocessing.py bu paketi üretir; backend.py bunu alır ve VLM'e gönderir.
-    packet_id, S1b ile S8 arasındaki izlenebilirlik bağlantısını kurar."""
-    video_id: str                  # hangi videodan üretildiği
-    source_start_sec: float        # seçilen ilk karenin zaman damgası
-    source_end_sec: float          # seçilen son karenin zaman damgası
-    frames: list[FrameMeta]        # seçilen her karenin meta bilgisi
-    grid_layout: GridLayout        # grid boyut bilgisi
-    enhancement: EnhancementInfo   # CLAHE uygulama bilgisi
-    grid_image_path: str           # disk üzerindeki grid JPEG'inin tam yolu
-    packet_id: str = field(default_factory=lambda: str(uuid.uuid4()))  # UUID
-    created_at: str = field(default_factory=_now_iso)  # UTC oluşturulma zamanı
+    :mod:`preprocessing` modülü tarafından üretilir; :mod:`vlm_backend` modülündeki
+    `infer()` fonksiyonuna girdi olarak sağlanır.
+
+    Attributes:
+        video_id (str): Analiz edilen videonun benzersiz kimliği.
+        source_start_sec (float): Grid paketine dahil edilen ilk karenin zaman damgası (sn).
+        source_end_sec (float): Grid paketine dahil edilen son karenin zaman damgası (sn).
+        frames (list[FrameMeta]): Seçilen karelerin ayrıntılı meta verileri listesi.
+        grid_layout (GridLayout): Grid'in satır, sütun ve hücre boyutlandırma bilgisi.
+        enhancement (EnhancementInfo): CLAHE ve ışık iyileştirme bilgileri.
+        grid_image_path (str): Diske kaydedilen birleştirilmiş JPEG grid görselinin mutlak yolu.
+        packet_id (str): Paket için üretilen benzersiz UUID (S1b ile S8 arasındaki izlenebilirliği sağlar).
+        created_at (str): Paketin ISO-8601 formatında UTC oluşturulma zamanı.
+    """
+    video_id: str
+    source_start_sec: float
+    source_end_sec: float
+    frames: list[FrameMeta]
+    grid_layout: GridLayout
+    enhancement: EnhancementInfo
+    grid_image_path: str
+    packet_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: str = field(default_factory=_now_iso)
 
     def to_dict(self) -> dict:
-        """JSON serializasyonu — tüm iç içe dataclass'ları dict'e çevirir."""
+        """Paketi JSON serileştirmeye uygun sözlük (dict) yapısına dönüştürür.
+
+        Returns:
+            dict: Tüm iç içe dataclass'ları içeren sözlük.
+        """
         return asdict(self)
 
 
 # ---------------------------------------------------------------------------
-# S8 — VLM çıktısı (backend.py → Karar Ajanı)
+# S8 — VLM Çıktısı (vlm_backend.py → Karar Ajanı)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class DetectedEntity:
-    """VLM'in tespit ettiği bir nesne/varlık.
-    label: kısa etiket (araç, kişi, yük…) — VLM kesin tür tahmini yapmamalı.
-    confidence_hint: modelin kendi güven değerlendirmesi (low/medium/high)."""
+    """VLM tarafından görsel olarak tespit edilen bir nesne veya varlık kaydı.
+
+    Attributes:
+        label (str): Varlığın genel tanımı (örn. 'person', 'forklift', 'truck', 'pallet').
+            Kanal B genel terimler tercih eder; kesin teknik sınıflandırma algı katmanına aittir.
+        confidence_hint (Literal["low", "medium", "high"]): Modelin tespit güven seviyesi.
+        notes_tr (str): Tespite dair kısa Türkçe açıklama veya belirsizlik notu.
+    """
     label: str
     confidence_hint: Literal["low", "medium", "high"]
-    notes_tr: str = ""             # ek açıklama (isteğe bağlı, Türkçe)
+    notes_tr: str = ""
 
 
 @dataclass
 class InferenceMetrics:
-    """VLM çağrısının performans metrikleri — izleme ve optimizasyon için."""
-    latency_ms: float              # toplam inference süresi (milisaniye)
-    tokens_generated: int          # üretilen token sayısı
+    """VLM model çağrısına ait çıkarım performansı ve kaynak kullanım metrikleri.
+
+    Attributes:
+        latency_ms (float): Model çağrısının ağ ve çıkarım süresi dahil toplam gecikmesi (ms).
+        tokens_generated (int): Modelin ürettiği tamamlama (completion) token sayısı.
+    """
+    latency_ms: float
+    tokens_generated: int
 
 
 @dataclass
 class RiskEvent:
-    """VLM'in kendi gözüyle tespit ettiği tek bir risk durumu.
+    """VLM tarafından görsel kanıtlara dayalı olarak tespit edilen tekil İSG risk durumu.
 
-    Düz bir metin listesi (eski ``risk_flags_tr``) Karar Ajanı'na riskin ne
-    kadar kritik olduğunu ve kaç kanıtla desteklendiğini söylemiyordu. Bu yapı
-    her riski şiddet + kanıt bilgisiyle taşır, böylece karar ajanı kanıt
-    ağırlıklandırması yapabilir.
+    Her bir risk olayı; şiddeti, modele özgü güven skoru ve tespit edildiği zaman/ızgara
+    kanıtlarıyla birlikte taşınır. Karar Ajanı bu sayede riskleri ağırlıklandırabilir.
 
-    İki kanıt biçimi desteklenir:
+    Desteklenen Kanıt Biçimleri:
+        - **Grid Modu:** Riskin görüldüğü grid hücre indeksleri `supporting_frame_positions` alanına yazılır.
+        - **Video Modu:** Riskin görüldüğü an videonun başından itibaren mutlak saniye olarak
+          `timestamp_sec` alanına atanır.
 
-    * **Grid modu** — kareler tek mozaikte gönderildiğinde riskin görüldüğü
-      hücre indeksleri ``supporting_frame_positions`` alanına yazılır.
-    * **Video modu** — video doğrudan gönderildiğinde riskin gerçekleştiği an
-      ``timestamp_sec`` alanına, tam videonun başından itibaren **mutlak**
-      saniye olarak yazılır (segment ofseti uygulanmış hâlde).
+    Attributes:
+        description_tr (str): Riskin Türkçe açıklaması (örn. 'Personel baretsiz çalışıyor').
+        severity (Literal["low", "medium", "high", "critical"]): Riskin önem derecesi:
+            - 'low': Düşük öncelikli durum.
+            - 'medium': Dikkat gerektiren kural ihlali.
+            - 'high': Ciddi kaza/hasar riski.
+            - 'critical': İnsan hayatını doğrudan tehlikeye atan acil durum.
+        confidence (float): Riske özgü olasılık/güven skoru (0.0 - 1.0).
+        supporting_frame_count (int): Riskin gözlemlendiği kare veya grid hücresi adedi.
+        supporting_frame_positions (list[int]): Riskin yer aldığı grid hücre pozisyonları listesi.
+        timestamp_sec (float | None): Riskin gerçekleştiği mutlak video saniyesi (video modunda).
     """
     description_tr: str
     severity: Literal["low", "medium", "high", "critical"]
-    confidence: float                              # 0-1, riske özgü güven
-    supporting_frame_count: int = 1                # kaç karede/hücrede görüldü
+    confidence: float
+    supporting_frame_count: int = 1
     supporting_frame_positions: list[int] = field(default_factory=list)
-    timestamp_sec: float | None = None             # video modu: mutlak saniye
+    timestamp_sec: float | None = None
 
 
-#: :attr:`RiskEvent.severity` değerlerinin sayısal karşılığı. Segmentleri
-#: kritiklik sırasına dizmek ve en kritik segmenti bulmak için kullanılır.
+#: Risk şiddetlerinin sayısal ağırlık karşılıkları. Sıralama ve en kritik olayı seçmede kullanılır.
 SEVERITY_RANK: dict[str, int] = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 @dataclass
 class VLMInterpretation:
-    """S8 sözleşmesi — Karar Ajanı'nın 3. GİRDİSİ.
+    """S8 Sözleşmesi — Karar Ajanı'nın 3. Girdisi Olan VLM Çıktısı.
 
-    backend.py bu paketi üretir; Karar Ajanı bunu alır ve Kanal A'nın
-    çıktısıyla (S2, S3) birleştirerek nihai kararı verir.
+    :mod:`vlm_backend` tarafından üretilir; Karar Ajanı (:mod:`src.reasoning.decision_agent`)
+    bu yorumu Kanal A'nın kural motoru çıktılarıyla (S2, S3) füzyon yaparak nihai kararı verir.
 
-    packet_id → S1b ile eşleşerek tam izlenebilirlik sağlar.
-    scene_summary_tr → olay motorundan BAĞIMSIZ Türkçe sahne yorumu (kritik!)
-    raw_model_output → debug/audit için saklanan ham model çıktısı.
-
-    Alan sırası notu: varsayılanı olan alanlar sonda toplanmıştır. Tüm
-    üreticiler (backend.py) anahtar kelimeli çağrı kullandığı için bu sıralama
-    çağıranları etkilemez.
+    Attributes:
+        packet_id (str): İlgili S1b paketiyle izlenebilirlik sağlayan benzersiz UUID.
+        video_id (str): Analiz edilen video kimliği.
+        model_name (str): Çıkarımda kullanılan modelin adı veya takma adı (örn. 'vlm', 'llm-large').
+        model_backend (Literal): Kullanılan çıkarım altyapısı ('vllm', 'llama.cpp', 'transformers', 'server').
+        scene_summary_tr (str): 1-3 cümlelik bağımsız Türkçe sahne özeti.
+        detected_entities (list[DetectedEntity]): Tespit edilen varlıklar listesi.
+        detected_actions_tr (list[str]): Sahnedeki eylemler listesi (Türkçe).
+        confidence_overall (float): Modelin kendi beyan ettiği genel güven derecesi (0.0 - 1.0).
+        inference (InferenceMetrics): Çıkarım süresi ve token metrikleri.
+        raw_model_output (str): Modelden gelen ham metin çıktısı (denetim ve hata ayıklama için).
+        risk_events (list[RiskEvent]): Tespit edilen yapılandırılmış risk olayları listesi.
+        risk_flags_tr (list[str]): Geriye dönük uyumluluk için düz metin risk açıklamaları listesi.
+        computed_confidence (float): Model öz güveninden bağımsız, dışsal metriklerle hesaplanan güven skoru.
+        reasoning_trace (str): Modelin akıl yürütme adımları (<think> bloğu içeriği).
+        segment_start_sec (float): Yorumun kapsadığı aralığın mutlak başlangıç saniyesi.
+        segment_end_sec (float): Yorumun kapsadığı aralığın mutlak bitiş saniyesi.
+        created_at (str): Paketin ISO-8601 UTC oluşturulma zamanı.
     """
-    packet_id: str                 # S1b VLMFramePacket.packet_id ile eşleşir
-    video_id: str                  # hangi videodan üretildiği
-    model_name: str                # kullanılan VLM modelinin adı
-    # "server" = OpenAI-uyumlu harici servis (TEKNOFEST EVREN dahil)
+    packet_id: str
+    video_id: str
+    model_name: str
     model_backend: Literal["vllm", "llama.cpp", "transformers", "server"]
-    scene_summary_tr: str          # 1-3 cümle Türkçe sahne özeti
-    detected_entities: list[DetectedEntity]   # tespit edilen varlıklar
-    detected_actions_tr: list[str]            # gözlemlenen eylemler (Türkçe)
-    confidence_overall: float      # 0-1 modelin öz güven değerlendirmesi
-    inference: InferenceMetrics    # performans metrikleri
-    raw_model_output: str          # ham LLM çıktısı (debug amaçlı)
+    scene_summary_tr: str
+    detected_entities: list[DetectedEntity]
+    detected_actions_tr: list[str]
+    confidence_overall: float
+    inference: InferenceMetrics
+    raw_model_output: str
 
-    # --- varsayılanı olan alanlar ---
+    # --- Varsayılanı Olan Alanlar ---
     risk_events: list[RiskEvent] = field(default_factory=list)
-    # Geriye dönük uyumluluk: eski tüketiciler (src/reasoning/decision_agent.py,
-    # backend/decision/main.py) düz metin listesi okur. Boş bırakılırsa
-    # __post_init__ bunu risk_events'ten türetir; böylece her tüketici çalışır.
     risk_flags_tr: list[str] = field(default_factory=list)
-    # Modelin öz güveninden BAĞIMSIZ, dışsal sinyallere dayanan güven skoru.
     computed_confidence: float = 0.0
-    # <think>...</think> içeriği (varsa); ayrıştırıcı izi sildiği için genelde boş.
     reasoning_trace: str = ""
-    # Bu yorumun tam video içindeki mutlak zaman aralığı. Segment bazlı
-    # iterasyonda her segment kendi ofsetini taşır; tek parça analizde 0-süre.
     segment_start_sec: float = 0.0
     segment_end_sec: float = 0.0
     created_at: str = field(default_factory=_now_iso)
 
     def __post_init__(self) -> None:
-        """``risk_flags_tr`` boşsa ``risk_events``ten türetir.
-
-        Yeni üreticiler yalnızca ``risk_events`` doldurur; eski tüketiciler ise
-        ``risk_flags_tr`` okur. Türetmeyi burada bir kez yapmak, her tüketicide
-        aynı dönüşümü tekrarlamayı önler.
-        """
+        """Geriye dönük uyumluluk amacıyla `risk_flags_tr` alanını `risk_events` üzerinden doldurur."""
         if not self.risk_flags_tr and self.risk_events:
             self.risk_flags_tr = [
                 ev.description_tr for ev in self.risk_events if ev.description_tr
@@ -193,25 +287,35 @@ class VLMInterpretation:
 
     @property
     def max_severity(self) -> str:
-        """Bu yorumdaki en yüksek risk şiddeti; risk yoksa ``"low"``."""
+        """Yorumdaki en yüksek risk derecesini ('critical', 'high', 'medium', 'low') döndürür."""
         if not self.risk_events:
             return "low"
         return max(self.risk_events, key=lambda e: SEVERITY_RANK.get(e.severity, 0)).severity
 
     def to_dict(self) -> dict:
-        """JSON serializasyonu — Karar Ajanı'na bu dict iletilir."""
+        """Yorum nesnesini JSON serileştirilebilir sözlüğe dönüştürür.
+
+        Returns:
+            dict: Karar Ajanı'na aktarılan S8 sözlüğü.
+        """
         return asdict(self)
 
 
 # ---------------------------------------------------------------------------
-# Segment bazlı (iterasyonlu) analiz sözleşmeleri
+# Segment Bazlı (İterasyonlu) Analiz Sözleşmeleri
 # ---------------------------------------------------------------------------
 
 def format_mmss(seconds: float) -> str:
-    """Saniyeyi ``MM:SS`` biçimine çevirir.
+    """Saniye cinsinden verilen süreyi 'MM:SS' formatına dönüştürür.
 
-    Zaman damgaları hem prompt'a hem nihai çıktıya bu biçimde girer; karar
-    ajanının şeması da ``MM:SS`` beklediği için dönüşüm tek yerde tutulur.
+    Hem VLM sistem promptlarında hem de Karar Ajanı zaman damgası şemalarında
+    tutarlı zaman gösterimi sağlamak amacıyla kullanılır.
+
+    Args:
+        seconds (float): Dönüştürülecek saniye miktarı.
+
+    Returns:
+        str: '01:23' biçiminde iki basamaklı dakika ve saniye dizesi.
     """
     total = max(0, int(round(seconds)))
     return f"{total // 60:02d}:{total % 60:02d}"
@@ -219,12 +323,13 @@ def format_mmss(seconds: float) -> str:
 
 @dataclass
 class SegmentResult:
-    """Tek bir video segmentinin analiz sonucu.
+    """Uzun videolardan kesilen tek bir video segmentinin analiz sonucu.
 
-    Uzun videolar 60 saniyelik parçalara bölünüp sırayla incelenir; her parça
-    için bir :class:`SegmentResult` üretilir. ``start_sec``/``end_sec`` tam
-    videoya göre **mutlak** zamanı verir, böylece segmentler birleştirildiğinde
-    olayların gerçek anı korunur.
+    Attributes:
+        segment_index (int): Segmentin 0-indeksli sıra numarası.
+        start_sec (float): Segmentin ana videodaki mutlak başlangıç saniyesi.
+        end_sec (float): Segmentin ana videodaki mutlak bitiş saniyesi.
+        interpretation (VLMInterpretation): Segment için üretilen bağımsız S8 yorumu.
     """
     segment_index: int
     start_sec: float
@@ -233,16 +338,20 @@ class SegmentResult:
 
     @property
     def duration_sec(self) -> float:
-        """Segmentin süresi (saniye)."""
+        """Segmentin saniye cinsinden süresi."""
         return max(0.0, self.end_sec - self.start_sec)
 
     @property
     def max_severity(self) -> str:
-        """Segmentteki en yüksek risk şiddeti."""
+        """Segment içinde tespit edilen en yüksek risk şiddeti derecesi."""
         return self.interpretation.max_severity
 
     def to_dict(self) -> dict:
-        """JSON serializasyonu."""
+        """Segment sonucunu sözlüğe serileştirir.
+
+        Returns:
+            dict: Zaman aralığı, şiddet ve yorum detaylarını içeren sözlük.
+        """
         return {
             "segment_index": self.segment_index,
             "start_sec": self.start_sec,
@@ -255,37 +364,34 @@ class SegmentResult:
 
 @dataclass
 class BatchResult:
-    """Segment segment incelenmiş bir videonun toplu sonucu.
+    """Parçalı (segmentli) analiz edilen bir videonun toplu sonuç kümesi.
 
-    Karar Ajanı'na tek bir S8 yorumu yerine bu toplu sonuç iletilebilir;
-    :meth:`to_interpretation_dict` ile tek yoruma indirgenmiş hâli de alınabilir
-    (mevcut tüketiciler tek yorum beklediği için).
+    Attributes:
+        video_id (str): Analiz edilen videonun kimliği.
+        segments (list[SegmentResult]): Başarıyla işlenen segment sonuçları listesi.
+        failed_segments (list[dict]): İşlenirken hata alan segmentlerin hata raporları listesi.
+        memory_context (str): Segmentler arası taşınan metin hafızasının son durumu.
+        created_at (str): ISO-8601 UTC oluşturulma zamanı.
     """
     video_id: str
     segments: list[SegmentResult] = field(default_factory=list)
-    #: İşlenemeyen segmentler. Sessiz veri kaybı yerine burada raporlanır;
-    #: karar ajanı analizin kısmi olduğunu bilerek güven ayarlar.
     failed_segments: list[dict] = field(default_factory=list)
-    #: Segmentler arası taşınan metin hafızasının son hâli.
     memory_context: str = ""
     created_at: str = field(default_factory=_now_iso)
 
     @property
     def total_segments(self) -> int:
-        """Başarıyla işlenen segment sayısı."""
+        """Başarıyla analiz edilmiş toplam segment adedi."""
         return len(self.segments)
 
     @property
     def total_risk_events(self) -> int:
-        """Tüm segmentlerdeki risk olaylarının toplamı."""
+        """Tüm segmentlerdeki risk olaylarının toplam adedi."""
         return sum(len(s.interpretation.risk_events) for s in self.segments)
 
     @property
     def most_critical_segment(self) -> SegmentResult | None:
-        """En yüksek şiddetli riski içeren segment; risk yoksa ``None``.
-
-        Eşitlikte, riske özgü güveni yüksek olan segment seçilir.
-        """
+        """En yüksek şiddette risk içeren segment nesnesi; risk yoksa None."""
         scored = [s for s in self.segments if s.interpretation.risk_events]
         if not scored:
             return None
@@ -299,14 +405,14 @@ class BatchResult:
 
     @property
     def all_risk_events(self) -> list[RiskEvent]:
-        """Tüm segmentlerin risk olayları, zaman sırasında tek listede."""
+        """Tüm segmentlerin risk olaylarının kronolojik sırada birleştirilmiş listesi."""
         events: list[RiskEvent] = []
         for seg in sorted(self.segments, key=lambda s: s.start_sec):
             events.extend(seg.interpretation.risk_events)
         return events
 
     def to_dict(self) -> dict:
-        """JSON serializasyonu."""
+        """Toplu sonucu JSON formatına uygun sözlüğe çevirir."""
         critical = self.most_critical_segment
         return {
             "video_id": self.video_id,
@@ -320,16 +426,15 @@ class BatchResult:
         }
 
     def to_interpretation_dict(self) -> dict:
-        """Toplu sonucu **tek** S8 yorum sözlüğüne indirger.
+        """Segment sonuçlarını tek bir S8 yorum sözlüğüne indirger (aggregate eder).
 
-        Mevcut tüketiciler (:mod:`src.reasoning.decision_agent`,
-        ``backend/decision/main.py``) tek bir yorum sözlüğü bekler. Bu metot
-        segmentleri birleştirir: özetler zaman aralıklarıyla etiketlenip
-        birleştirilir, risk olayları mutlak zamanlarıyla toplanır, güven
-        skorları ortalanır.
+        Geriye dönük uyumluluk sağlamak adına :mod:`src.reasoning.decision_agent` gibi
+        tekil S8 sözlüğü bekleyen tüketicilere birleştirilmiş çıktı sunar.
+        Segment özetleri zaman aralıklarıyla etiketlenir, tespit edilen varlıklar
+        tekilleştirilir ve riskler kronolojik sırayla toplanır.
 
         Returns:
-            :meth:`VLMInterpretation.to_dict` ile aynı anahtarlara sahip sözlük.
+            dict: Tek bir S8 VLMInterpretation nesnesinin `to_dict()` yapısıyla uyumlu sözlük.
         """
         if not self.segments:
             return {
@@ -364,8 +469,6 @@ class BatchResult:
                     entities.append(asdict(ent))
             for ev in interp.risk_events:
                 item = asdict(ev)
-                # Segment yorumu zaman damgasını üretmediyse segment başlangıcı
-                # en iyi tahmindir; aksi hâlde olay zamansız kalır.
                 if item.get("timestamp_sec") is None:
                     item["timestamp_sec"] = seg.start_sec
                 item["timestamp"] = format_mmss(float(item["timestamp_sec"]))
@@ -389,45 +492,40 @@ class BatchResult:
 
 
 # ---------------------------------------------------------------------------
-# Metin tabanlı anlamsal + zamansal hafıza (iterasyonlu analiz için)
+# Metin Tabanlı Anlamsal ve Zamansal Hafıza (İterasyonlu Analiz İçin)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class VideoAnalysisMemory:
-    """Segmentler arasında taşınan, **metin tabanlı** anlamsal ve zamansal hafıza.
+    """Segmentler arasında taşınan, metin tabanlı anlamsal ve zamansal hafıza yöneticisi.
 
-    Neden metin, neden sınırlı?
-      Uzun bir video 60 saniyelik parçalara bölünüp sırayla incelenir. Sonraki
-      segmentin bağlamı olmadan yorumlanması, süregelen durumları (aynı kişi,
-      aynı araç, devam eden risk) görmezden gelir. Öte yandan önceki
-      segmentlerin **ham çıktılarını** biriktirmek bağlam penceresini hızla
-      doldurur. Bu sınıf ikisinin arasını tutar: her segmentten yalnızca
-      damıtılmış metin satırları saklanır ve satır sayısı üst sınırla
-      kırpılır. Böylece bağlam maliyeti segment sayısıyla doğrusal büyümek
-      yerine sabit bir tavana oturur.
+    Tasarım Mantığı:
+        Uzun videolarda önceki segmentlerin ham yanıtlarını veya token dizilerini
+        biriktirmek LLM bağlam penceresini (context window) hızla tüketir.
+        Bu sınıf, her segmentin S8 yorumundan yalnızca öz anlamsal bilgileri (varlıklar,
+        mekan özellikleri) ve zaman damgalı risk olaylarını damıtır. Belirlenen
+        tavan limitlere (`max_semantic_notes`, `max_temporal_events`) ulaşıldığında
+        en eski kayıtları budayarak sabit bir bağlam bütçesi sağlar.
 
-    İki tür hafıza ayrı tutulur:
-      * **Anlamsal** (:attr:`semantic_notes`): sahnenin ve varlıkların kalıcı
-        nitelikleri — "depo içi, raflı alan", "beyaz kasklı personel".
-      * **Zamansal** (:attr:`temporal_events`): mutlak zaman damgalı olay
-        satırları — "01:12 — personel merdivenden düştü [high]".
+    Attributes:
+        semantic_notes (list[str]): Mekan ve varlık niteliklerini tutan notlar.
+        temporal_events (list[str]): Zaman damgalı olay ve risk satırları.
+        max_semantic_notes (int): Tutulacak azami anlamsal not adedi (varsayılan 12).
+        max_temporal_events (int): Tutulacak azami zamansal olay adedi (varsayılan 40).
+        max_note_chars (int): Bir anlamsal notun azami karakter uzunluğu (varsayılan 240).
     """
     semantic_notes: list[str] = field(default_factory=list)
     temporal_events: list[str] = field(default_factory=list)
-    #: Saklanacak azami anlamsal not sayısı (en yeniler korunur).
     max_semantic_notes: int = 12
-    #: Saklanacak azami zamansal olay satırı (en yeniler korunur).
     max_temporal_events: int = 40
-    #: Tek bir anlamsal notun azami karakter uzunluğu.
     max_note_chars: int = 240
 
     def absorb(self, interpretation: VLMInterpretation, segment_start_sec: float = 0.0) -> None:
-        """Bir segment yorumunu damıtıp hafızaya ekler.
+        """Yeni bir segment yorumunu işleyerek hafızaya damıtır ve ekler.
 
         Args:
-            interpretation: Segmentin S8 yorumu.
-            segment_start_sec: Segmentin tam videodaki mutlak başlangıcı;
-                yorumun kendi zaman damgası yoksa olay zamanı buna dayanır.
+            interpretation (VLMInterpretation): Segmentten elde edilen S8 yorum nesnesi.
+            segment_start_sec (float, optional): Segmentin ana videodaki mutlak başlangıç saniyesi.
         """
         summary = (interpretation.scene_summary_tr or "").strip()
         if summary:
@@ -454,21 +552,25 @@ class VideoAnalysisMemory:
         self._trim()
 
     def _trim(self) -> None:
-        """Hafızayı üst sınırlara kırpar (en yeni kayıtlar korunur)."""
+        """Hafıza boyutlarını tanımlı azami sınırlara kırpar (en güncel kayıtları korur)."""
         if len(self.semantic_notes) > self.max_semantic_notes:
             self.semantic_notes = self.semantic_notes[-self.max_semantic_notes :]
         if len(self.temporal_events) > self.max_temporal_events:
             self.temporal_events = self.temporal_events[-self.max_temporal_events :]
 
     def is_empty(self) -> bool:
-        """Hafızada hiç kayıt yoksa ``True``."""
+        """Hafızada kayıt bulunup bulunmadığını kontrol eder.
+
+        Returns:
+            bool: Anlamsal veya zamansal hiçbir kayıt yoksa True.
+        """
         return not self.semantic_notes and not self.temporal_events
 
     def to_prompt_context(self) -> str:
-        """Hafızayı sonraki segmentin prompt'una eklenecek metne çevirir.
+        """Hafızadaki bilgileri bir sonraki segmentin VLM sistem promptuna eklenecek metne çevirir.
 
         Returns:
-            Boş hafızada boş dize; aksi hâlde iki başlıklı özet metin.
+            str: Prompt içerisine enjekte edilmeye hazır özet bağlam metni.
         """
         if self.is_empty():
             return ""
@@ -482,7 +584,7 @@ class VideoAnalysisMemory:
         return "\n".join(lines)
 
     def to_dict(self) -> dict:
-        """JSON serializasyonu."""
+        """Hafıza durumunu sözlüğe dönüştürür."""
         return {
             "semantic_notes": list(self.semantic_notes),
             "temporal_events": list(self.temporal_events),
